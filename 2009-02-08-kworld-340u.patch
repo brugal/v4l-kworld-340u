@@ -1,0 +1,217 @@
+diff -r 80a3bec444d3 em2880-dvb.c
+--- a/em2880-dvb.c	Thu Feb 05 09:48:48 2009 +0100
++++ b/em2880-dvb.c	Sun Feb 08 13:48:53 2009 -0500
+@@ -48,6 +48,7 @@
+ #include "qt1010/qt1010.h"
+ #include "mt2060/mt2060.h"
+ #include "adimtv102/adimtv102.h"
++#include "tda18271/tda18271.h"
+ 
+ #include "lgdt330x.h"
+ #include "sharp/s921_module.h"
+@@ -911,6 +912,9 @@
+ 	.i2c_address = 0x30>>1
+ };
+ 
++static struct tda18271_config em2870_tda18271_config = {
++};
++
+ static int em2880_dvb_init(struct em28xx *dev)
+ {
+ 	struct em2880_dvb *dvb_dev;
+@@ -1007,6 +1011,7 @@
+ 				&dev->i2c_adap);
+ 		break;
+ 	case EM2883_BOARD_EMPIA_HYBRID_ATSC:
++	case EM2870_BOARD_KWORLD_340U:
+ 	case EM2883_BOARD_EQUINUX_TUBESTICK_ATSC:
+ 		dvb_dev->frontend = dvb_attach(lgdt3304_attach,
+ 				&lgdt3304_atsc_config, &dev->i2c_adap);
+@@ -1079,6 +1084,9 @@
+ 		case TUNER_ADIMTV102:
+ 			dvb_attach(adimtv102_attach, dvb_dev->frontend, &dev->i2c_adap, &dmbt_adim_config);
+ 			break;
++		case TUNER_PHILIPS_TDA18271:
++			 dvb_attach(tda18271_attach, dvb_dev->frontend, 0x60, &dev->i2c_adap, &em2870_tda18271_config);
++			 break;
+ 		default:
+ 			printk(KERN_INFO"unsupported tuner (%d)\n",
+ 					dev->tuner_type);
+diff -r 80a3bec444d3 em28xx-cards.c
+--- a/em28xx-cards.c	Thu Feb 05 09:48:48 2009 +0100
++++ b/em28xx-cards.c	Sun Feb 08 13:48:53 2009 -0500
+@@ -2454,8 +2454,8 @@
+ 		.dvbnorms	= EETI_XC3028_DEFAULT_DVBT,
+ #endif
+ 	},
+-	[EM2883_BOARD_KWORLD_A340] = {
+-		.name         = "KWorld ATSC 340",
++	[EM2870_BOARD_KWORLD_340U] = {
++		.name         = "KWorld ATSC 340U",
+ 		.tuner_type   = TUNER_PHILIPS_TDA18271,
+ 		.dev_modes    = EM28XX_ATSC,
+ 	},
+@@ -2748,6 +2748,7 @@
+ 	{ USB_DEVICE(0xeb1a, 0xe306), .driver_info = EM2883_BOARD_KWORLD_HYBRID_F306 }, /* development only */
+ 	{ USB_DEVICE(0x1b80, 0xe329), .driver_info = EM2888_BOARD_KWORLD_HYBRID_E329 },
+ 	{ USB_DEVICE(0xeb1a, 0x2889), .driver_info = EM2888_BOARD_EMPIA_HYBRID },
++	{ USB_DEVICE(0x1b80, 0xa340), .driver_info = EM2870_BOARD_KWORLD_340U },
+ 	{ USB_DEVICE(0xeb1a, 0xe323), .driver_info = EM2883_BOARD_KWORLD_HYBRID_E323 },
+ 	{ USB_DEVICE(0xeb1a, 0xa139), .driver_info = EM2888_BOARD_LINCOLN_TV_FM },
+ #if 0
+@@ -3020,6 +3021,40 @@
+ 		mdelay(70);
+ 		break;
+ 	}
++	case EM2870_BOARD_KWORLD_340U:
++	{
++		ret = em28xx_write_regs(dev, R0F_XCLK_REG, "\x07", 1);  /* protocol? */
++		if (ret < 0)
++			return ret;
++		ret = em28xx_write_regs(dev, R06_I2C_CLK_REG, "\x4c", 1);
++		if (ret < 0)
++			return ret;
++		ret = em28xx_write_regs(dev, 0x08, "\xfe", 1);
++		if (ret < 0)
++			return ret;
++		ret = em28xx_write_regs(dev, 0x04, "\xde", 1);
++		if (ret < 0)
++			return ret;
++		ret = em28xx_write_regs(dev, 0x04, "\xfe", 1);
++		if (ret < 0)
++			return ret;
++		ret = em28xx_write_regs(dev, 0x08, "\xfd", 1);
++		if (ret < 0)
++			return ret;
++		ret = em28xx_write_regs(dev, 0x04, "\xff", 1);
++		if (ret < 0)
++			return ret;
++		ret = em28xx_write_regs(dev, 0x08, "\xfd", 1);
++		if (ret < 0)
++			return ret;
++		ret = em28xx_write_regs(dev, 0x04, "\xff", 1);
++		if (ret < 0)
++			return ret;
++		ret = em28xx_write_regs(dev, 0x08, "\xfd", 1);
++		if (ret < 0)
++			return ret;
++		break;
++	}
+ 	case EM2870_BOARD_KWORLD_350U:
+ 	{
+ 		ret = em28xx_write_regs(dev, R0F_XCLK_REG, "\x27", 1);
+diff -r 80a3bec444d3 em28xx.h
+--- a/em28xx.h	Thu Feb 05 09:48:48 2009 +0100
++++ b/em28xx.h	Sun Feb 08 13:48:53 2009 -0500
+@@ -121,7 +121,7 @@
+ #define EM2883_BOARD_KWORLD_HYBRID_F306		  65
+ #define EM2888_BOARD_KWORLD_HYBRID_E329		  66
+ #define EM2883_BOARD_KWORLD_HYBRID_E323		  67
+-#define EM2883_BOARD_KWORLD_A340		  68
++#define EM2870_BOARD_KWORLD_340U		  68
+ #define EM2888_BOARD_LINCOLN_TV_FM		  69
+ #define EM2888_BOARD_DVB_TC_HYBRID		  70
+ #define EM2888_BOARD_EMPIA_HYBRID                 71
+diff -r 80a3bec444d3 tda18271/tda18271.h
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/tda18271/tda18271.h	Sun Feb 08 13:48:53 2009 -0500
+@@ -0,0 +1,99 @@
++/*
++    tda18271.h - header for the Philips / NXP TDA18271 silicon tuner
++
++    Copyright (C) 2007, 2008 Michael Krufky <mkrufky@linuxtv.org>
++
++    This program is free software; you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation; either version 2 of the License, or
++    (at your option) any later version.
++
++    This program is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with this program; if not, write to the Free Software
++    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++*/
++
++#ifndef __TDA18271_H__
++#define __TDA18271_H__
++
++#include <linux/i2c.h>
++#include "dvb_frontend.h"
++
++struct tda18271_std_map_item {
++	u16 if_freq;
++
++	/* EP3[4:3] */
++	unsigned int agc_mode:2;
++	/* EP3[2:0] */
++	unsigned int std:3;
++	/* EP4[7] */
++	unsigned int fm_rfn:1;
++	/* EP4[4:2] */
++	unsigned int if_lvl:3;
++	/* EB22[6:0] */
++	unsigned int rfagc_top:7;
++};
++
++struct tda18271_std_map {
++	struct tda18271_std_map_item fm_radio;
++	struct tda18271_std_map_item atv_b;
++	struct tda18271_std_map_item atv_dk;
++	struct tda18271_std_map_item atv_gh;
++	struct tda18271_std_map_item atv_i;
++	struct tda18271_std_map_item atv_l;
++	struct tda18271_std_map_item atv_lc;
++	struct tda18271_std_map_item atv_mn;
++	struct tda18271_std_map_item atsc_6;
++	struct tda18271_std_map_item dvbt_6;
++	struct tda18271_std_map_item dvbt_7;
++	struct tda18271_std_map_item dvbt_8;
++	struct tda18271_std_map_item qam_6;
++	struct tda18271_std_map_item qam_8;
++};
++
++enum tda18271_role {
++	TDA18271_MASTER = 0,
++	TDA18271_SLAVE,
++};
++
++enum tda18271_i2c_gate {
++	TDA18271_GATE_AUTO = 0,
++	TDA18271_GATE_ANALOG,
++	TDA18271_GATE_DIGITAL,
++};
++
++struct tda18271_config {
++	/* override default if freq / std settings (optional) */
++	struct tda18271_std_map *std_map;
++
++	/* master / slave tuner: master uses main pll, slave uses cal pll */
++	enum tda18271_role role;
++
++	/* use i2c gate provided by analog or digital demod */
++	enum tda18271_i2c_gate gate;
++
++	/* some i2c providers cant write all 39 registers at once */
++	unsigned int small_i2c:1;
++};
++
++#if defined(CONFIG_MEDIA_TUNER_TDA18271) || (defined(CONFIG_MEDIA_TUNER_TDA18271_MODULE) && defined(MODULE))
++extern struct dvb_frontend *tda18271_attach(struct dvb_frontend *fe, u8 addr,
++					    struct i2c_adapter *i2c,
++					    struct tda18271_config *cfg);
++#else
++static inline struct dvb_frontend *tda18271_attach(struct dvb_frontend *fe,
++						   u8 addr,
++						   struct i2c_adapter *i2c,
++						   struct tda18271_config *cfg)
++{
++	printk(KERN_WARNING "%s: driver disabled by Kconfig\n", __func__);
++	return NULL;
++}
++#endif
++
++#endif /* __TDA18271_H__ */

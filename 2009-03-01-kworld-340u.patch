@@ -1,0 +1,3464 @@
+diff -r 80a3bec444d3 .hgignore
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/.hgignore	Sun Mar 01 13:18:05 2009 -0500
+@@ -0,0 +1,12 @@
++syntax: regexp
++
++syntax: glob
++*.cmd
++*.mod
++*.mod.c
++*.mod.o
++*.order
++*.ko
++*.o
++*.symvers
++*.patch
+diff -r 80a3bec444d3 em2880-dvb.c
+--- a/em2880-dvb.c	Thu Feb 05 09:48:48 2009 +0100
++++ b/em2880-dvb.c	Sun Mar 01 13:18:05 2009 -0500
+@@ -48,11 +48,12 @@
+ #include "qt1010/qt1010.h"
+ #include "mt2060/mt2060.h"
+ #include "adimtv102/adimtv102.h"
++#include "tda18271/tda18271.h"
+ 
+ #include "lgdt330x.h"
+ #include "sharp/s921_module.h"
+ 
+-#define EM2880_DVB_NUM_PACKETS 64
++#define EM2880_DVB_NUM_PACKETS 64  //256  //64
+ #define EM2880_URB_COUNT 32
+ 
+ #if defined DVB_DEFINE_MOD_OPT_ADAPTER_NR
+@@ -335,13 +336,17 @@
+ 		if (urb->iso_frame_desc[i].status != 0) {
+ 			dprintk(1, "em2880-dvb.c: status != 0\n");
+ 			continue;
+-		} else if (urb->iso_frame_desc[i].actual_length > 0)
++		} else if (urb->iso_frame_desc[i].actual_length > 0) {
+ 			dvb_dmx_swfilter(&dvb_dev->demux,
+ 					urb->transfer_buffer +
+ 					urb->iso_frame_desc[i].offset,
+-					urb->iso_frame_desc[i]
+-					.actual_length);
++					urb->iso_frame_desc[i].actual_length);
++			dprintk(1, "[%02d] %d ", i, urb->iso_frame_desc[i].actual_length);
++		}
++		urb->iso_frame_desc[i].status = 0;
++		urb->iso_frame_desc[i].actual_length = 0;
+ 	}
++	dprintk(1, "\n");
+ 
+ 	status = usb_submit_urb(urb, GFP_ATOMIC);
+ 	if (status)
+@@ -911,6 +916,9 @@
+ 	.i2c_address = 0x30>>1
+ };
+ 
++static struct tda18271_config em2870_tda18271_config = {
++};
++
+ static int em2880_dvb_init(struct em28xx *dev)
+ {
+ 	struct em2880_dvb *dvb_dev;
+@@ -1007,6 +1015,7 @@
+ 				&dev->i2c_adap);
+ 		break;
+ 	case EM2883_BOARD_EMPIA_HYBRID_ATSC:
++	case EM2870_BOARD_KWORLD_340U:
+ 	case EM2883_BOARD_EQUINUX_TUBESTICK_ATSC:
+ 		dvb_dev->frontend = dvb_attach(lgdt3304_attach,
+ 				&lgdt3304_atsc_config, &dev->i2c_adap);
+@@ -1079,6 +1088,9 @@
+ 		case TUNER_ADIMTV102:
+ 			dvb_attach(adimtv102_attach, dvb_dev->frontend, &dev->i2c_adap, &dmbt_adim_config);
+ 			break;
++		case TUNER_PHILIPS_TDA18271:
++				dvb_attach(tda18271_attach, dvb_dev->frontend, 0x60, &dev->i2c_adap, &em2870_tda18271_config);
++				break;
+ 		default:
+ 			printk(KERN_INFO"unsupported tuner (%d)\n",
+ 					dev->tuner_type);
+@@ -1118,9 +1130,15 @@
+ 
+ 	for (i = 0; i < dev->uif->altsetting[1].desc.bNumEndpoints; i++) {
+ 		if (dev->uif->altsetting[1].endpoint[i].desc.bEndpointAddress == 0x84) {
++
++				//FIXME hack
++				//dev->uif->altsetting[1].endpoint[i].desc.wMaxPacketSize = cpu_to_le16(0x02f0);
++				//dev->uif->altsetting[1].endpoint[i].desc.wMaxPacketSize = cpu_to_le16(188);
++
+ 			dvb_dev->dtv_packetsize =
+ 				le16_to_cpu(dev->uif->altsetting[1].endpoint[i].
+ 				desc.wMaxPacketSize);
++			printk(" dtv_packetsize %d  0x%x\n", dvb_dev->dtv_packetsize, dvb_dev->dtv_packetsize);
+ 			break;
+ 		}
+ 	}
+diff -r 80a3bec444d3 em2880-dvb.c-2009-02-15-01
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/em2880-dvb.c-2009-02-15-01	Sun Mar 01 13:18:05 2009 -0500
+@@ -0,0 +1,1330 @@
++/*
++ *  Empiatech em2880 DVB-T extension
++ *
++ *  Copyright (C) 2006/2007/2008 Markus Rechberger <mrechberger@gmail.com>
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++ */
++
++#include <linux/init.h>
++#include <linux/list.h>
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/slab.h>
++#include <linux/delay.h>
++#include <linux/kthread.h>
++#include <linux/suspend.h>
++#include <linux/dvb/frontend.h>
++#include <linux/usb.h>
++#include <linux/version.h>
++
++#include <linux/init.h>
++#include <linux/list.h>
++#include <linux/module.h>
++
++#include "em28xx.h"
++
++#include <media/tuner.h>
++#include <media/v4l2-common.h>
++#include "dvb_frontend.h"
++
++#include "zl10353/zl10353.h"
++#include "mt352/mt352.h"
++#include "xc5000/xc5000_control.h"
++#include "drx3973d/drx3973d_demod.h"
++#include "lgdt3304/lgdt3304.h"
++#include "qt1010/qt1010.h"
++#include "mt2060/mt2060.h"
++#include "adimtv102/adimtv102.h"
++#include "tda18271/tda18271.h"
++
++#include "lgdt330x.h"
++#include "sharp/s921_module.h"
++
++#define ISO_MAX_PKT 32          /* max number of packets in an ISOC transfer */
++#define ISO_MAX_SIZE 0x8000     /* max size of one URB buffer (32 Kb) */
++#define ENDPOINT_ADDR 0x84
++
++#define ALT_SETTING 1
++#define EM2880_DVB_NUM_PACKETS 64  //128  //64
++#define EM2880_URB_COUNT 32
++
++#if defined DVB_DEFINE_MOD_OPT_ADAPTER_NR
++DVB_DEFINE_MOD_OPT_ADAPTER_NR(adapter_nr);
++#endif
++
++
++#define xc3028_offset_8mhz 2750000;
++#define xc3028_offset_7mhz 2250000;
++#define xc3028_offset_6mhz 2750000;
++#define xc3028_offset_atsc 1750000;
++
++
++MODULE_DESCRIPTION("Empiatech em2880 DVB-T extension");
++MODULE_AUTHOR("Markus Rechberger <mrechberger@gmail.com>");
++MODULE_LICENSE("GPL");
++
++
++DRX3973DData_t DRX3973DData_g = {
++	0,
++	0,
++	0,
++	0,
++	0,
++	0,
++	0,
++	0,
++	0,
++	0,
++	0,
++	0,
++	0,
++	0,
++	DRX_UIO_MODE_DISABLE,
++	DRX_UIO_MODE_DISABLE,
++	{
++		DRX3973D_AGC_CTRL_AUTO,
++		0,
++		0,
++		0,
++		0,
++		0
++	},
++	{
++		DRX3973D_AGC_CTRL_AUTO,
++		0,
++		0,
++		0,
++		0,
++		0
++	},
++	DRX3973D_IFFILTER_SAW,
++	FALSE,
++	DRX_BANDWIDTH_8MHZ,
++	FALSE,
++	DRX3973D_APPENV_PORTABLE,
++	TRUE,
++	FALSE,
++#ifndef _CH_
++	{
++		"01234567890",
++		"01234567890"
++	},
++	{
++		{
++			DRX_MODULE_UNKNOWN,
++			(char *)(NULL),
++			0,
++			0,
++			0,
++			(char *)(NULL)
++		},
++		{
++			DRX_MODULE_UNKNOWN,
++			(char *)(NULL),
++			0,
++			0,
++			0,
++			(char *)(NULL)
++		}
++	},
++	{
++		{
++			(pDRXVersion_t)(NULL),
++			(pDRXVersionList_t)(NULL)
++		},
++		{
++			(pDRXVersion_t)(NULL),
++			(pDRXVersionList_t)(NULL)
++		}
++	},
++	DRX3973D_SPIN_UNKNOWN,
++	{
++	},
++	FALSE,
++
++#if (DRXD_TYPE_B)
++	DRX3973D_I2C_INIT_ASEL
++#endif
++
++
++
++#endif
++};
++
++/**
++ * \var DRX3973DDefaultAddr_g
++ * \brief Default I2C address and device identifier.
++ */
++I2CDeviceAddr_t DRX3973DDefaultAddr_g = {
++#define DRX3973D_DEF_I2C_ADDR ((0xe0)>>1)
++	DRX3973D_DEF_I2C_ADDR,     /* i2c address */
++#define DRX3973D_DEF_DEMOD_DEV_ID   (1)
++	DRX3973D_DEF_DEMOD_DEV_ID,  /* device id */
++	NULL       /* private data structure */
++};
++
++/**
++ * \var DRX3973DDefaultCommAttr_g
++ * \brief Default common attributes of a drx3973d demodulator instance.
++ */
++DRXCommonAttr_t DRX3973DDefaultCommAttr_g = {
++	(pu8_t)NULL,
++	0,
++	TRUE,
++	4560,
++	48000L,
++	12000L,
++	0L,
++	FALSE,
++	TRUE,
++	TRUE,
++	TRUE,
++	FALSE,
++	FALSE,
++	FALSE,
++	FALSE,
++	FALSE,
++	FALSE,
++	32000000UL,
++	FALSE,
++	(pDRXScanParam_t)(NULL),
++	0,
++	0,
++	FALSE,
++	0L,
++	0L,
++	100,
++	DRX_LOCKED,
++	FALSE,
++	DRX_POWER_DOWN,
++	1,
++	0L,
++	0L
++};
++
++static int alt_setting = ALT_SETTING;
++module_param(alt_setting, int, 0644);
++MODULE_PARM_DESC(debug, "em2880-dvb alternate setting");
++
++
++static unsigned int debug;
++module_param(debug, int, 0644);
++MODULE_PARM_DESC(debug, "em2880-dvb debug level (default off)");
++
++#define dprintk(lvl, fmt, args...) if (debug >= lvl) do {\
++		printk(fmt, ##args); \
++	} while (0)
++
++static int em2880_set_alternate(struct em2880_dvb *dvb_dev);
++
++/* ------------------------------------------------------------------ */
++
++/* FRONTEND TEMPLATE */
++
++
++
++static int em2880_fe_init(struct dvb_frontend *fe) {
++	return 0;
++}
++
++static int em2880_fe_sleep(struct dvb_frontend *fe) {
++	return 0;
++}
++
++static int em2880_fe_set_frontend(struct dvb_frontend *fe, struct dvb_frontend_parameters *param) {
++	return 0;
++}
++
++static int em2880_fe_get_frontend(struct dvb_frontend* fe, struct dvb_frontend_parameters *param) {
++	return 0;
++}
++
++static int em2880_fe_get_tune_settings(struct dvb_frontend *fe, struct dvb_frontend_tune_settings *tune_settings) {
++	tune_settings->min_delay_ms = 0;
++	tune_settings->step_size = 0;
++	tune_settings->max_drift = 0;
++	return 0;
++}
++
++static int em2880_fe_read_status(struct dvb_frontend *fe, fe_status_t *status) {
++	*status = FE_HAS_CARRIER | FE_HAS_VITERBI | FE_HAS_LOCK | FE_HAS_SYNC | FE_HAS_SIGNAL;
++	return 0;
++}
++
++static int em2880_fe_read_ber(struct dvb_frontend *fe, u32 *ber) {
++	return 0;
++}
++
++static int em2880_fe_read_signal_strength(struct dvb_frontend *fe, u16 *strength) {
++	return 0;
++}
++
++static int em2880_fe_read_snr(struct dvb_frontend *fe, u16 *snr) {
++	return 0;
++}
++
++static int em2880_fe_read_ucblocks(struct dvb_frontend *fe, u32 *ucblocks) {
++	return 0;
++}
++
++static void em2880_fe_release(struct dvb_frontend *fe) {
++}
++
++static struct dvb_frontend_ops em2880_fe_template_ops = {
++	.info = {
++		.name = "Empia Frontend Template",
++		.type = FE_QAM,
++		.frequency_min = 0,
++		.frequency_max = 900000000,
++		.frequency_stepsize = 1,
++		.symbol_rate_min = 0,
++		.symbol_rate_max = 10000000,
++		.symbol_rate_tolerance = 1,
++		.caps = 0
++	},
++	.init = em2880_fe_init,
++	.release = em2880_fe_release,
++
++	.sleep = em2880_fe_sleep,
++	.set_frontend = em2880_fe_set_frontend,
++	.get_frontend = em2880_fe_get_frontend,
++	.get_tune_settings = em2880_fe_get_tune_settings,
++	.read_status = em2880_fe_read_status,
++	.read_ber = em2880_fe_read_ber,
++	.read_signal_strength = em2880_fe_read_signal_strength,
++	.read_snr = em2880_fe_read_snr,
++	.read_ucblocks = em2880_fe_read_ucblocks
++};
++
++/* end frontend template */
++
++//static struct usb_host_endpoint *get_ep(
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 19)
++static void em2880_complete_irq(struct urb *urb, struct pt_regs *ptregs)
++{
++#else
++static void em2880_complete_irq(struct urb *urb)
++{
++#endif
++	struct em2880_dvb *dvb_dev = urb->context;
++	int i;
++	int status;
++
++	//printk("complete irq\n");
++	if (dvb_dev == NULL) {
++		dprintk(1, "em2880-dev.c: device not valid!\n");
++		return;
++	}
++
++	if (debug && urb->status < 0) {
++		printk(KERN_ERR"%s:%u:%s(): status = %i\n", __FILE__,
++				__LINE__, __func__, urb->status);
++	}
++
++	switch (urb->status) {
++	case -ESHUTDOWN:
++		return;
++		break;
++	}
++
++	if (urb->status == -ENOENT)
++		return;
++
++	for (i = 0; i < urb->number_of_packets; i++) {
++		if (urb->iso_frame_desc[i].status != 0) {
++			dprintk(1, "em2880-dvb.c: status != 0\n");
++			continue;
++		} else if (urb->iso_frame_desc[i].actual_length > 0) {
++				//printk("got sometihng %d\n", urb->iso_frame_desc[i].actual_length);
++			dvb_dmx_swfilter(&dvb_dev->demux,
++					urb->transfer_buffer +
++					urb->iso_frame_desc[i].offset,
++					urb->iso_frame_desc[i]
++					.actual_length);
++		} else {
++				//dprintk(1, "frame %d actual_length %d\n", i, urb->iso_frame_desc[i].actual_length);
++		}
++	}
++
++	status = usb_submit_urb(urb, GFP_ATOMIC);
++	if (status)
++		dprintk(1, "resubmitting urb failed!\n");
++}
++
++static void em2880_stop_stream(struct em2880_dvb *dvb_dev)
++{
++	int i;
++	int arg;
++	int npkt;
++	int bsize;
++
++	for (i = 0; i < EM2880_DVB_NUM_BUFS; i++) {
++		if (dvb_dev->urb[i]) {
++				npkt = dvb_dev->urb[i]->number_of_packets;
++				bsize = dvb_dev->urb[i]->transfer_buffer_length;
++
++			usb_kill_urb(dvb_dev->urb[i]);
++			if (dvb_dev->transfer_buffer[i]) {
++				usb_buffer_free(dvb_dev->udev,
++								(EM2880_DVB_NUM_PACKETS *
++								dvb_dev->dtv_packetsize),
++								//bsize,
++						dvb_dev->transfer_buffer[i],
++						dvb_dev->urb[i]->transfer_dma);
++			}
++			usb_free_urb(dvb_dev->urb[i]);
++		}
++		dvb_dev->urb[i] = NULL;
++		dvb_dev->transfer_buffer[i] = NULL;
++	}
++	arg = EM28XX_REG_OFF;
++	dvb_dev->em28xx_dev->em28xx_gpio_control(dvb_dev->em28xx_dev, EM28XX_LED1_ON, &arg);
++
++}
++
++static int em2880_start_stream(struct em2880_dvb *dvb_dev)
++{
++	int i, errCode;
++	int arg;
++	const int sb_size = EM2880_DVB_NUM_PACKETS * dvb_dev->dtv_packetsize;
++	struct usb_host_endpoint *ep;
++	int mx;
++	int psize, npkt;
++	int bsize;
++	unsigned int pipe;
++
++	dprintk(1, "em2880-dvb.c: got start stream request %s\n", __func__);
++	//printk("sb_size %d\n", sb_size);
++	arg = EM28XX_REG_ON;
++	dvb_dev->em28xx_dev->em28xx_gpio_control(dvb_dev->em28xx_dev, EM28XX_LED1_ON, &arg);
++
++	em2880_set_alternate(dvb_dev);
++
++	//pipe = usb_rcvisocpipe(dvb_dev->dev, ENDPOINT_ADDR);  //ep->desc.bEndpointAddress);
++	//ep = (usb_pipein(pipe) ? urb->dev->ep_in : urb->dev->ep_out)[usb_pipeendpoint(urb->pipe)];
++	psize = dvb_dev->dtv_packetsize;
++	//psize = le16_to_cpu(ep->desc.wMaxPacketSize);
++	psize = (psize & 0x07ff) * (1 + ((psize >> 11) & 3));
++	npkt = ISO_MAX_SIZE / psize;
++	if (npkt > ISO_MAX_PKT) {
++			printk("npkt (%d) > ISO_MAX_PKT (%d)\n", npkt, ISO_MAX_PKT);
++			npkt = ISO_MAX_PKT;
++	}
++	bsize = psize * npkt;
++	dprintk(1, "wMaxPakcketSize: %d  psize: %d  npkt: %d  bsize: %d\n", dvb_dev->dtv_packetsize, psize, npkt, bsize);
++	bsize = EM2880_DVB_NUM_PACKETS * dvb_dev->dtv_packetsize;
++
++	/* allocate urbs */
++
++	for (i = 0; i < EM2880_DVB_NUM_BUFS; i++) {
++		struct urb *urb;
++		int j, k;
++		/* allocate transfer buffer */
++		urb = usb_alloc_urb(EM2880_DVB_NUM_PACKETS, GFP_KERNEL);
++		//urb = usb_alloc_urb(npkt, GFP_KERNEL);
++		if (!urb) {
++			dprintk(1, "cannot alloc urb %i\n", i);
++			//FIXME destroy any of the other urbs and buffers allocated
++			return -ENOMEM;
++		}
++		dvb_dev->transfer_buffer[i] =
++				//usb_buffer_alloc(dvb_dev->udev, sb_size,
++				usb_buffer_alloc(dvb_dev->udev, bsize,
++					GFP_KERNEL, &urb->transfer_dma);
++
++		if (!dvb_dev->transfer_buffer[i]) {
++			dprintk(1, "unable to allocate %i bytes for transfer"
++				   "buffer %i\n", bsize, i);
++			//FIXME destroy other urbs and buffers created
++			return -ENOMEM;
++		}
++		//memset(dvb_dev->transfer_buffer[i], 0, sb_size);
++		memset(dvb_dev->transfer_buffer[i], 0, bsize);
++		urb->dev = dvb_dev->udev;
++		urb->context = dvb_dev;
++		//urb->pipe = usb_rcvisocpipe(dvb_dev->udev, ENDPOINT_ADDR);
++		//printk("ep addr 0x%x\n", ep->desc.bEndpointAddress);
++		//urb->pipe = usb_rcvisocpipe(dvb_dev->udev, ep->desc.bEndpointAddress);
++		urb->pipe = usb_rcvisocpipe(dvb_dev->udev, ENDPOINT_ADDR);
++#if 1
++		ep = (usb_pipein(urb->pipe) ? urb->dev->ep_in : urb->dev->ep_out)[usb_pipeendpoint(urb->pipe)];
++		mx = le16_to_cpu(ep->desc.wMaxPacketSize);
++#endif
++		if (mx <= 0) {
++				printk("wtf mx <= 0   %d\n", mx);
++		}
++		dprintk(1, "ep->desc.wMaxPacketSize  %d  %d\n", ep->desc.wMaxPacketSize, mx);
++
++		urb->transfer_flags = URB_ISO_ASAP;
++		//urb->interval = 1;
++		urb->interval = 1;  //ep->desc.bInterval;
++		urb->transfer_buffer = dvb_dev->transfer_buffer[i];
++		urb->complete = em2880_complete_irq;
++		//urb->number_of_packets = npkt;  //EM2880_DVB_NUM_PACKETS;
++		urb->number_of_packets = EM2880_DVB_NUM_PACKETS;  //npkt;  //EM2880_DVB_NUM_PACKETS;
++		urb->transfer_buffer_length = bsize;  //sb_size;
++		for (j = k = 0; j < EM2880_DVB_NUM_PACKETS;
++		//for (j = k = 0;  j < npkt;
++			 j++, k += dvb_dev->dtv_packetsize) {
++			 //j++, k += psize) {
++			urb->iso_frame_desc[j].offset = k;
++			urb->iso_frame_desc[j].length =
++					dvb_dev->dtv_packetsize;
++					//psize;
++			urb->iso_frame_desc[j].status = 0;
++		}
++		dvb_dev->urb[i] = urb;
++	}
++
++	/* submit urbs */
++	for (i = 0; i < EM2880_DVB_NUM_BUFS; i++) {
++			int j;
++		errCode = usb_submit_urb(dvb_dev->urb[i], GFP_KERNEL);
++		if (errCode) {
++			dprintk(1, "submit of urb %i failed (error=%i)\n",
++					i,
++					errCode);
++			// find out why
++			if (dvb_dev->udev->speed == USB_SPEED_HIGH) {
++					int mult = 1 + ((mx >> 11) & 0x03);
++					mx &= 0x07ff;
++					mx *= mult;
++					printk("high speed\n");
++			}
++			printk("mx: %d\n", mx);
++
++			for (j = 0;  j < dvb_dev->urb[i]->number_of_packets;  j++) {
++					if (dvb_dev->urb[i]->iso_frame_desc[j].status != -EXDEV) {
++							printk("failed at %d   %d\n", j, dvb_dev->urb[i]->iso_frame_desc[j].length);
++							break;
++					}
++			}
++			return errCode;
++		}
++	}
++	return 0;
++}
++
++static int em2880_set_alternate(struct em2880_dvb *dvb_dev)
++{
++	int errCode;
++	errCode = usb_set_interface(dvb_dev->udev, dvb_dev->em28xx_dev->usb_interface, alt_setting);
++	printk("%s  errCode %d, interface %d  alt %d\n", __func__, errCode, dvb_dev->em28xx_dev->usb_interface, alt_setting);
++	return errCode;
++}
++
++static int em2880_start_feed(struct dvb_demux_feed *dvbdmxfeed)
++{
++	struct dvb_demux *demux = dvbdmxfeed->demux;
++	struct em2880_dvb *dvb_dev = demux->priv;
++	dprintk(1, "em2880-dvb.c: got start feed request %s\n", __func__);
++
++	if (mutex_lock_interruptible(&dvb_dev->sem))
++		return -ERESTARTSYS;
++
++	if (dvb_dev->streaming == 0)
++		em2880_start_stream(dvb_dev);
++
++	dvb_dev->streaming++;
++	mutex_unlock(&dvb_dev->sem);
++	return 0;
++}
++
++static int em2880_stop_feed(struct dvb_demux_feed *dvbdmxfeed)
++{
++	struct dvb_demux *demux = dvbdmxfeed->demux;
++	struct em2880_dvb *dvb_dev = demux->priv;
++
++	dprintk(1, "em2880-dvb.c: got stop feed request %s\n", __func__);
++
++	if (mutex_lock_interruptible(&dvb_dev->sem))
++		return -ERESTARTSYS;
++	if (0 == --dvb_dev->streaming)
++		em2880_stop_stream(dvb_dev);
++	mutex_unlock(&dvb_dev->sem);
++	return 0;
++}
++
++static int em28xx_ts_bus_ctrl_int(struct em28xx *dev, int acquire)
++{
++	u8 gpio;
++	gpio = dev->em28xx_read_reg(dev, 04);
++	gpio &= ~((u8)0x3);
++
++	if (acquire == 1)
++		gpio |= 1;
++
++	return dev->em28xx_write_regs(dev, 0x04, &gpio, 1);
++}
++
++static int em28xx_ts_bus_ctrl(struct dvb_frontend *fe, int acquire)
++{
++	struct em28xx *dev = fe->dvb->priv;
++	return dev->em28xx_acquire(dev, EM28XX_DVBT, acquire);
++}
++
++static struct zl10353_config em2880_zl10353_dev = {
++	.demod_address = (0x1e >> 1),
++	.no_tuner = 1,
++	.parallel_ts = 1,
++	.if2 = 45600
++};
++
++struct bcode {
++	int reg;
++	char *txt;
++	int len;
++	int delay;
++};
++
++
++static int mt352_pinnacle_init(struct dvb_frontend *fe)
++{
++	int i;
++	struct bcode zlconf[] = {
++			{0x1e, "\x8a\x2c", 2, 0},
++			{0x1e, "\x89\x38", 2, 0},
++			{0x1e, "\x50\x80", 2, 0},
++			{0x1e, "\x8e\x40", 2, 0},
++			{0x1e, "\x69\x00", 2, 0},
++			{0x1e, "\x6a\xff", 2, 0},
++			{0x1e, "\x6b\xff", 2, 0},
++			{0x1e, "\x6c\x00", 2, 0},
++			{0x1e, "\x6d\xff", 2, 0},
++			{0x1e, "\x6e\x00", 2, 0},
++			{0x1e, "\x6f\x40", 2, 0},
++			{0x1e, "\x70\x40", 2, 0},
++			{0x1e, "\x68\xa0", 2, 0},
++
++			{0x1e, "\x56\x31", 2, 0},  /* set input frequency */
++			{0x1e, "\x57\xb8", 2, 0},
++			{0x1e, "\x75\x33", 2, 0},
++
++			{0x1e, "\x7c\x00", 2, 0},
++			{0x1e, "\x7d\x4d", 2, 0},
++			{0x1e, "\xb5\x7a", 2, 0},
++			{0x1e, "\x51\x40", 2, 0},
++			{0x1e, "\x52\x80", 2, 0},
++			{0x1e, "\x53\x50", 2, 0},
++			{0x1e, "\x5d\x01", 2, 0},
++			{}
++	};
++	for (i = 0; zlconf[i].txt; i++)
++		fe->ops.write(fe, zlconf[i].txt, zlconf[i].len);
++	return 0;
++}
++
++
++static struct mt352_config em2880_mt352_dev = {
++	.demod_address = (0x1e >> 1),
++	.no_tuner = 1,
++#if 0
++	.parallel_ts = 1,
++#endif
++	.if2 = 45600,
++	.demod_init = mt352_pinnacle_init,
++};
++
++
++static struct zl10353_config em2880_zl10353_pinnacle = {
++	.demod_address = (0x1e >> 1),
++	.no_tuner = 1,
++	.parallel_ts = 1,
++};
++
++static struct zl10353_config em2880_kworld_355u_dev = {
++	.demod_address = (0x1e >> 1),
++	.no_tuner = 1,
++	.parallel_ts = 1,
++};
++
++static struct lgdt330x_config em2880_lgdt3303_dev = {
++	.demod_address = 0x0e,
++	.demod_chip = LGDT3303
++};
++
++static struct mt2060_config em2870_mt2060_config = {
++	.i2c_address = 0x60
++};
++
++static struct qt1010_config em2870_qt1010_config = {
++	.i2c_address = 0x62
++};
++
++static int kworld355u_i2c_gate_ctrl(struct dvb_frontend *fe, int enable)
++{
++	struct zl10353_state {
++		struct i2c_adapter *i2c;
++		struct dvb_frontend frontend;
++
++		struct zl10353_config config;
++
++		enum fe_bandwidth bandwidth;
++	};
++	struct zl10353_state *state = fe->demodulator_priv;
++
++	struct em28xx *dev = state->i2c->algo_data;
++
++	return em28xx_ts_bus_ctrl_int(dev, enable);
++}
++
++static struct lgdt3304_config lgdt3304_atsc_config = {
++	.i2c_address = 0x0e
++};
++
++static int em28xx_set_params(struct dvb_frontend *fe,
++		struct dvb_frontend_parameters *params)
++{
++	struct em28xx *dev = fe->dvb->priv;
++	struct em2880_dvb *dvbdev = dev->dvb_dev;
++	int i;
++	unsigned long frequency = params->frequency;
++	struct dvb_ofdm_parameters *op = &params->u.ofdm;
++
++	if (!dev->tuner)
++		return -EINVAL;
++
++	switch (fe->ops.info.type) {
++	case FE_OFDM:
++		if (dev->dvbnorm->bandwidth !=
++				op->bandwidth) {
++			for (i = 0; dev->board->dvbnorms[i].tv_mode || dev->board->dvbnorms[i].index; i++) {
++				if (dev->board->dvbnorms[i].bandwidth == op->bandwidth) {
++					switch (dev->tuner_type) {
++					case TUNER_XCEIVE_XC3028:
++					{
++						struct xc3028_init_cmd cmd;
++						dvbdev->bw_index = i;
++						cmd.new_tv_mode_ptr = dev->board->dvbnorms[i].tv_mode;
++						cmd.new_channel_map_ptr = dev->board->dvbnorms[i].channelmap;
++						dev->dvbnorm = &dev->board->dvbnorms[i];
++						if (dev->tuner->tuner_cmd)
++							dev->tuner->tuner_cmd(dev->tuner, XC3028_INIT_TUNER, &cmd);
++						break;
++					}
++					case TUNER_XCEIVE_XC5000:
++					{
++						struct xc_std_conf cmd;
++						dvbdev->bw_index = i;
++						cmd.index = dev->board->dvbnorms[i].index;
++						dev->dvbnorm = &dev->board->dvbnorms[i];
++						dev->tuner->tuner_cmd(dev->tuner, XC5000_SET_MODE, &cmd);
++						break;
++					}
++					}
++					break;
++				}
++			}
++		}
++
++		if (dev->tuner->set_frequency) {
++			switch (params->u.ofdm.bandwidth) {
++			case BANDWIDTH_AUTO:
++			case BANDWIDTH_8_MHZ:
++				frequency -= xc3028_offset_8mhz;
++				break;
++			case BANDWIDTH_7_MHZ:
++				frequency -= xc3028_offset_7mhz;
++				break;
++			case BANDWIDTH_6_MHZ:
++				frequency -= xc3028_offset_6mhz;
++				break;
++			default:
++				return -EINVAL;
++			}
++			dev->tuner->set_frequency(dev->tuner, frequency);
++			dev->dctl_freq = frequency;
++		}
++		break;
++	case FE_QAM:
++		switch (dev->tuner_type) {
++		case TUNER_XCEIVE_XC3028:
++		{
++			struct xc3028_init_cmd cmd;
++			dvbdev->bw_index = 0;
++			cmd.new_tv_mode_ptr = dev->board->qamnorms[0].tv_mode;
++			cmd.new_channel_map_ptr = dev->board->qamnorms[0].channelmap;
++			dev->qamnorm = &dev->board->qamnorms[0];
++			if (dev->tuner->tuner_cmd)
++				dev->tuner->tuner_cmd(dev->tuner, XC3028_INIT_TUNER, &cmd);
++			break;
++		}
++		case TUNER_XCEIVE_XC5000:
++		{
++			struct xc_std_conf cmd;
++			dvbdev->bw_index = 0;
++			cmd.index = dev->board->atscnorms[0].index;
++			dev->atscnorm = &dev->board->atscnorms[0];
++			dev->tuner->tuner_cmd(dev->tuner, XC5000_SET_MODE, &cmd);
++			break;
++		}
++		}
++		frequency -= xc3028_offset_atsc;
++
++		dev->tuner->set_frequency(dev->tuner, frequency);
++		dev->dctl_freq = frequency;
++		break;
++	case FE_ATSC:
++		switch (dev->tuner_type) {
++		case TUNER_XCEIVE_XC3028:
++		{
++			struct xc3028_init_cmd cmd;
++			dvbdev->bw_index = 0;
++			cmd.new_tv_mode_ptr = dev->board->atscnorms[0].tv_mode;
++			cmd.new_channel_map_ptr = dev->board->atscnorms[0].channelmap;
++			dev->atscnorm = &dev->board->atscnorms[0];
++			if (dev->tuner->tuner_cmd)
++				dev->tuner->tuner_cmd(dev->tuner, XC3028_INIT_TUNER, &cmd);
++			break;
++		}
++		case TUNER_XCEIVE_XC5000:
++		{
++			struct xc_std_conf cmd;
++			dvbdev->bw_index = 0;
++			cmd.index = dev->board->atscnorms[0].index;
++			dev->atscnorm = &dev->board->atscnorms[0];
++			dev->tuner->tuner_cmd(dev->tuner, XC5000_SET_MODE, &cmd);
++			break;
++		}
++		}
++
++		frequency -= xc3028_offset_atsc;
++		dev->tuner->set_frequency(dev->tuner, frequency);
++		dev->dctl_freq = frequency;
++		break;
++	case FE_QPSK:
++		printk(KERN_INFO"FE_QPSK currently not supported\n");
++		break;
++	}
++
++	return 0;
++}
++
++static int em28xx_get_frequency(struct dvb_frontend *fe, u32 *frequency)
++{
++	struct em28xx *dev = fe->dvb->priv;
++	*frequency = dev->dctl_freq;
++	return 0;
++}
++
++static int em28xx_get_bandwidth(struct dvb_frontend *fe, u32 *bandwidth)
++{
++	struct em28xx *dev = fe->dvb->priv;
++	struct em2880_dvb *dvbdev = dev->dvb_dev;
++	*bandwidth = (u32)dev->board->dvbnorms[dvbdev->bw_index].bandwidth;
++	return 0;
++}
++
++static int em28xx_dvb_init(struct dvb_frontend *fe)
++{
++	struct em28xx *dev = fe->dvb->priv;
++	int gpio_arg;
++
++	printk(KERN_INFO"em28xx_dvb_init\n");
++
++	if (dev->mode != V4L2_TUNER_DIGITAL_TV) {
++		printk(KERN_INFO"switching over from %d\n", dev->mode);
++		gpio_arg = EM28XX_REG_OFF;
++		dev->em28xx_gpio_control(dev, EM28XX_ANALOG_ON,    &gpio_arg);
++
++		gpio_arg = EM28XX_REG_ON;
++		dev->em28xx_gpio_control(dev, EM28XX_TS1_ON,       &gpio_arg);
++		dev->em28xx_gpio_control(dev, EM28XX_TUNER1_ON,    &gpio_arg);
++		dev->em28xx_gpio_control(dev, EM28XX_DEMOD1_RESET, NULL);
++		mdelay(100);
++	}
++	dev->mode = V4L2_TUNER_DIGITAL_TV;
++	msleep(100);
++	switch (dev->tuner_type) {
++	case TUNER_XCEIVE_XC3028:
++	{
++		struct xc3028_init_cmd cmd;
++		if (dev->dev_modes & EM28XX_DVBT) {
++			cmd.new_tv_mode_ptr = dev->dvbnorm->tv_mode;
++			cmd.new_channel_map_ptr = dev->dvbnorm->channelmap;
++		} else if (dev->dev_modes & EM28XX_ATSC) {
++			cmd.new_tv_mode_ptr = dev->atscnorm->tv_mode;
++			cmd.new_channel_map_ptr = dev->atscnorm->channelmap;
++		}
++
++		if (dev->tuner && dev->tuner->tuner_cmd)
++			dev->tuner->tuner_cmd(dev->tuner, XC3028_INIT_TUNER, &cmd);
++		break;
++	}
++	case TUNER_XCEIVE_XC5000:
++	{
++		struct xc_std_conf cmd;
++		if (dev->dev_modes & EM28XX_DVBT)
++			cmd.index = dev->dvbnorm->index;
++		else if (dev->dev_modes & EM28XX_ATSC)
++			cmd.index = dev->atscnorm->index;
++
++		printk(KERN_INFO"initializing: %d\n", dev->dvbnorm->index);
++		dev->tuner->tuner_cmd(dev->tuner, XC5000_INIT_TUNER, NULL);
++
++		if (dev->tuner && dev->tuner->tuner_cmd)
++			dev->tuner->tuner_cmd(dev->tuner, XC5000_SET_MODE, &cmd);
++	}
++	}
++
++	return 0;
++}
++
++static int em28xx_s921_init(struct dvb_frontend *fe)
++{
++	struct em28xx *dev = fe->dvb->priv;
++	struct em2880_dvb *dvbdev = dev->dvb_dev;
++	switch (dev->em_type) {
++	case EM2875:
++		dev->em28xx_write_regs_req(dev, 0x00, 0x5f, "\x01", 1);
++		break;
++	default:
++		break;
++	}
++	if (dvbdev->init_override)
++		dvbdev->init_override(fe);
++
++	return 0;
++}
++
++static int em28xx_zl10353_init(struct dvb_frontend *fe)
++{
++	struct em28xx *dev = fe->dvb->priv;
++	struct em2880_dvb *dvbdev = dev->dvb_dev;
++
++	int gpio_arg;
++
++#if 0
++	if (dev->mode != V4L2_TUNER_DIGITAL_TV) {
++#endif
++		dev->em28xx_write_regs_req(dev, 0x00, 0x48, "\x00", 1);
++		dev->em28xx_write_regs_req(dev, 0x00, 0x12, "\x77", 1);
++
++		gpio_arg = EM28XX_REG_OFF;
++		dev->em28xx_gpio_control(dev, EM28XX_ANALOG_ON,    &gpio_arg);
++		gpio_arg = EM28XX_REG_ON;
++		dev->em28xx_gpio_control(dev, EM28XX_TS1_ON,       &gpio_arg);
++		dev->em28xx_gpio_control(dev, EM28XX_TUNER1_ON,    &gpio_arg);
++		dev->em28xx_gpio_control(dev, EM28XX_DECODER_SLEEP, &gpio_arg);
++		dev->em28xx_gpio_control(dev, EM28XX_DEMOD1_RESET, NULL);
++		mdelay(100);
++#if 0
++	}
++#endif
++	dev->mode = V4L2_TUNER_DIGITAL_TV;
++	msleep(100);
++
++	if (dvbdev->init_override)
++		dvbdev->init_override(fe);
++
++	switch (dev->em_type) {
++	case EM2888:
++		dev->em28xx_write_regs_req(dev, 0x00, 0x5f, "\x01", 1);
++		/* TODO move this to zl10353, though keep backward compatibility */
++		dev->em28xx_write_regs_req(dev, 0x02, 0x1e, "\x50\x0b", 2);
++		dev->em28xx_write_regs_req(dev, 0x02, 0x1e, "\x51\x64", 2);
++		break;
++	case EM2875:
++		dev->em28xx_write_regs_req(dev, 0x00, 0x5f, "\x01", 1);
++		break;
++	default:
++		dev->em28xx_write_regs_req(dev, 0x02, 0x1e, "\x50\x0b", 2);
++		dev->em28xx_write_regs_req(dev, 0x02, 0x1e, "\x51\x44", 2);
++		break;
++	}
++	return 0;
++}
++
++
++static int em28xx_zl10353_sleep(struct dvb_frontend *fe)
++{
++	struct em28xx *dev = fe->dvb->priv;
++#if 0
++	int gpio_arg = EM28XX_REG_OFF;
++#endif
++	if (dev->mode == V4L2_TUNER_DIGITAL_TV && dev->powersaving) {
++#if 0
++		dev->em28xx_gpio_control(dev, EM28XX_TS1_ON,       &gpio_arg);
++#endif
++		printk(KERN_INFO"powered down zl10353\n");
++	}
++	return 0;
++}
++
++
++static int em28xx_dvb_sleep(struct dvb_frontend *fe)
++{
++	struct em28xx *dev = fe->dvb->priv;
++#if 0
++	int gpio_arg;
++#endif
++	if (dev->mode == V4L2_TUNER_DIGITAL_TV && dev->powersaving) {
++#if 0
++		dev->tuner->shutdown(dev->tuner);
++#endif
++#if 0
++		gpio_arg = EM28XX_REG_OFF;
++		dev->em28xx_gpio_control(dev, EM28XX_TUNER1_ON,    &gpio_arg);
++		printk(KERN_INFO"powered down xc3028\n");
++#endif
++	}
++	return 0;
++}
++
++struct adimtv102_config dmbt_adim_config = {
++	.i2c_address = 0xc2>>1
++};
++
++struct s921_config sharp_isdbt_config = {
++	.i2c_address = 0x30>>1
++};
++
++static struct tda18271_config em2870_tda18271_config = {
++};
++
++static int em2880_dvb_init(struct em28xx *dev)
++{
++	struct em2880_dvb *dvb_dev;
++	int err;
++	u16 if1 = 1220;
++	int gpio_arg;
++	int i;
++	struct dvb_demux *dvbdemux;
++
++	printk(KERN_INFO"em2880-dvb.c: DVB Init\n");
++	if (NULL == dev) {
++		dprintk(1, "em2880-dvb.c: no device attached?\n");
++		return -ENOMEM;
++	}
++
++	dvb_dev = kzalloc(sizeof(struct em2880_dvb), GFP_KERNEL);
++	if (!dvb_dev) {
++		dprintk(1, "out of memory!\n");
++		return -ENOMEM;
++	}
++
++	mutex_init(&dvb_dev->sem);
++
++	dev->em28xx_write_regs_req(dev, 0x00, 0x48, "\x00", 1);
++	dev->em28xx_write_regs_req(dev, 0x00, 0x12, "\x77", 1);
++
++
++	if (dev->dvbnorm == NULL) {
++		kfree(dvb_dev);
++		return -EINVAL;
++	}
++
++	gpio_arg = EM28XX_REG_OFF;
++	dev->em28xx_gpio_control(dev, EM28XX_ANALOG_ON,    &gpio_arg);
++	gpio_arg = EM28XX_REG_ON;
++	dev->em28xx_gpio_control(dev, EM28XX_TS1_ON,       &gpio_arg);
++	dev->em28xx_gpio_control(dev, EM28XX_TUNER1_ON,    &gpio_arg);
++	dev->em28xx_gpio_control(dev, EM28XX_DECODER_SLEEP, &gpio_arg);
++	dev->em28xx_gpio_control(dev, EM28XX_DEMOD1_RESET, NULL);
++	mdelay(100);
++	dev->mode = V4L2_TUNER_DIGITAL_TV;
++
++
++	switch (dev->model) {
++	case EM2880_BOARD_HAUPPAUGE_WINTV_HVR_900_R2:
++	case EM2882_BOARD_PINNACLE_HYBRID_PRO:
++		dvb_dev->frontend = dvb_attach(drx3973d_attach,
++				&DRX3973DDefaultCommAttr_g,
++				&DRX3973DDefaultAddr_g,
++				&DRX3973DData_g,
++				&dev->i2c_adap);
++		break;
++	case EM2883_BOARD_TERRATEC_HYBRID_XS_FM:
++	case EM2880_BOARD_HAUPPAUGE_WINTV_HVR_900:
++	case EM2880_BOARD_TERRATEC_HYBRID_XS:
++	case EM2880_BOARD_TERRATEC_HYBRID_XS_FR:
++	case EM2882_BOARD_TERRATEC_HYBRID_XS:
++	case EM2882_BOARD_LEADTEK_PALMTOP_DTV_200H:
++	case EM2870_BOARD_TERRATEC_XS:
++	case EM2881_BOARD_PINNACLE_HYBRID_PRO:
++	case EM2881_BOARD_DNT_DA2_HYBRID:
++	case EM2880_BOARD_MSI_DIGIVOX_AD:
++	case EM2880_BOARD_MSI_DIGIVOX_AD_II:
++	case EM2870_BOARD_KWORLD_350U:
++	case EM2883_BOARD_KWORLD_HYBRID_E323:
++	case EM2888_BOARD_KWORLD_HYBRID_E329:
++	case EM2888_BOARD_EMPIA_HYBRID:
++	case EM2880_BOARD_TERRATEC_PRODIGY_XS:
++		dvb_dev->frontend = dvb_attach(zl10353_attach,
++				&em2880_zl10353_dev, &dev->i2c_adap);
++		if (dvb_dev->frontend == NULL)
++			dvb_dev->frontend = dvb_attach(mt352_attach,
++				&em2880_mt352_dev, &dev->i2c_adap);
++
++		break;
++	case EM2870_BOARD_TERRATEC_XS_MT2060:
++		dvb_dev->frontend = dvb_attach(zl10353_attach,
++				&em2880_zl10353_pinnacle, &dev->i2c_adap);
++		break;
++	case EM2883_BOARD_HAUPPAUGE_WINTV_HVR_950:
++	case EM2883_BOARD_PINNACLE_PCTV_HD_PRO:
++	case EM2883_BOARD_KWORLD_HYBRID_A316:
++	case EM2883_BOARD_ATI_TVWONDER600:
++		dvb_dev->frontend = dvb_attach(lgdt330x_attach,
++				&em2880_lgdt3303_dev, &dev->i2c_adap);
++		break;
++	case EM2870_BOARD_KWORLD_355U:
++	case EM2870_BOARD_COMPRO_VIDEOMATE:
++		em28xx_ts_bus_ctrl_int(dev, 0);
++		/* fall through */
++	case EM2870_BOARD_PINNACLE_PCTV_DVB:
++		dvb_dev->frontend = dvb_attach(zl10353_attach,
++				&em2880_kworld_355u_dev,
++				&dev->i2c_adap);
++		break;
++	case EM2883_BOARD_EMPIA_HYBRID_ATSC:
++	case EM2870_BOARD_KWORLD_340U:
++	case EM2883_BOARD_EQUINUX_TUBESTICK_ATSC:
++		dvb_dev->frontend = dvb_attach(lgdt3304_attach,
++				&lgdt3304_atsc_config, &dev->i2c_adap);
++		break;
++	case EM2875_BOARD_SAMPLE_ISDBT:
++
++#if 1
++		dvb_dev->frontend = dvb_attach(s921_attach,
++				&sharp_isdbt_config, &dev->i2c_adap);
++#endif
++		if (dvb_dev->frontend) {
++			dvb_dev->frontend->tuner_priv = dev;
++			dvb_dev->init_override = dvb_dev->frontend->ops.init;
++			dvb_dev->frontend->ops.init = em28xx_s921_init;
++		} else {
++			printk(KERN_ERR "failed to initialize s921\n");
++		}
++		break;
++	case EM2879_BOARD_SAMPLE_DMB:
++#if 0
++		dvb_dev->frontend = dvb_attach(dmb_attach,
++				&sharp_dmb_config, &dev->i2c_adap);
++#endif
++		break;
++	case EM2888_BOARD_TERRATEC_XS_HTC:
++	case EM28175_BOARD_EMPIA_HYBRID:
++	case EM2885_BOARD_EMPIA_DVBC:
++		dvb_dev->frontend = kzalloc(sizeof(struct dvb_frontend), GFP_KERNEL);
++		memcpy(&dvb_dev->frontend->ops, &em2880_fe_template_ops, sizeof(struct dvb_frontend_ops));
++		printk("em2880-dvb: registering DVB-T/C template device\n");
++		break;
++	default:
++		printk(KERN_INFO"em2880-dvb.c: unsupported device\n");
++		kfree(dvb_dev);
++		return -EINVAL;
++	}
++
++	if (dvb_dev->frontend && dev->model != EM2875_BOARD_SAMPLE_ISDBT && 
++                                 dev->model != EM2888_BOARD_TERRATEC_XS_HTC &&
++				 dev->model != EM2885_BOARD_EMPIA_DVBC &&
++				 dev->model != EM28175_BOARD_EMPIA_HYBRID) {
++		switch (dev->tuner_type) {
++		case TUNER_XCEIVE_XC3028:
++		case TUNER_XCEIVE_XC5000:
++			dvb_dev->frontend->tuner_priv = dev;
++			dvb_dev->frontend->ops.tuner_ops.set_params =
++				em28xx_set_params;
++			dvb_dev->frontend->ops.tuner_ops.get_frequency =
++				em28xx_get_frequency;
++			dvb_dev->frontend->ops.tuner_ops.get_bandwidth =
++				em28xx_get_bandwidth;
++
++			/* xc3028 powersaving mode */
++			dvb_dev->frontend->ops.tuner_ops.init =
++				em28xx_dvb_init;
++			dvb_dev->frontend->ops.tuner_ops.sleep =
++				em28xx_dvb_sleep;
++			break;
++		case TUNER_MT2060:
++			dvb_attach(mt2060_attach, dvb_dev->frontend,
++					&dev->i2c_adap, &em2870_mt2060_config,
++					if1);
++			break;
++		case TUNER_QT1010:
++			dvb_dev->frontend->ops.i2c_gate_ctrl =
++				kworld355u_i2c_gate_ctrl;
++			dvb_attach(qt1010_attach, dvb_dev->frontend,
++					&dev->i2c_adap, &em2870_qt1010_config);
++			break;
++		case TUNER_ADIMTV102:
++			dvb_attach(adimtv102_attach, dvb_dev->frontend, &dev->i2c_adap, &dmbt_adim_config);
++			break;
++		case TUNER_PHILIPS_TDA18271:
++			 dvb_attach(tda18271_attach, dvb_dev->frontend, 0x60, &dev->i2c_adap, &em2870_tda18271_config);
++			 break;
++		default:
++			printk(KERN_INFO"unsupported tuner (%d)\n",
++					dev->tuner_type);
++		}
++
++		/* zl10353 powersaving */
++		dvb_dev->init_override = dvb_dev->frontend->ops.init;
++
++		dvb_dev->frontend->ops.sleep = em28xx_zl10353_sleep;
++		dvb_dev->frontend->ops.init = em28xx_zl10353_init;
++	}
++
++	if (NULL == dvb_dev->frontend) {
++		printk(KERN_INFO"em2880-dvb.c: failed initializing zl10353"
++		       "DVB-T demodulator\n");
++		printk(KERN_INFO"em2880-dvb.c: retrying with mt352 DVB-T"
++				"demodulator\n");
++		if (NULL == dvb_dev->frontend) {
++			printk(KERN_INFO"em2880-dvb.c: no luck with mt352"
++			       "demodulator, not attaching em2880-dvb\n");
++			kfree(dvb_dev);
++			return -ENODEV;
++		}
++	}
++
++	/* this is not backward compatible */
++#if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 20)
++	dvb_dev->frontend->ops.ts_bus_ctrl = em28xx_ts_bus_ctrl;
++#endif
++
++	dvb_register_adapter(&dvb_dev->adapter, "em2880 DVB-T", THIS_MODULE,
++			&dev->udev->dev
++#if defined DVB_DEFINE_MOD_OPT_ADAPTER_NR
++			, adapter_nr
++#endif
++	);
++
++	for (i = 0; i < dev->uif->altsetting[alt_setting].desc.bNumEndpoints; i++) {
++		if (dev->uif->altsetting[alt_setting].endpoint[i].desc.bEndpointAddress == ENDPOINT_ADDR) {
++			dvb_dev->dtv_packetsize =
++				le16_to_cpu(dev->uif->altsetting[alt_setting].endpoint[i].
++				desc.wMaxPacketSize);
++			dev->uif->altsetting[alt_setting].endpoint[i].desc.wMaxPacketSize = cpu_to_le16(0x02f0);
++			printk(" ----   0x%x  ----\n", cpu_to_le16(0x02f0));
++			dprintk(1, "dtv_packetsize %d  0x%x\n", dvb_dev->dtv_packetsize, dvb_dev->dtv_packetsize);
++			break;
++		}
++	}
++
++	dvb_dev->adapter.priv = dev;
++
++	dvb_register_frontend(&dvb_dev->adapter, dvb_dev->frontend);
++
++	dvb_dev->demux.priv = dvb_dev;
++	dvb_dev->demux.filternum = 256;
++	dvb_dev->demux.feednum = 256;
++	dvb_dev->demux.start_feed = em2880_start_feed;
++	dvb_dev->demux.stop_feed = em2880_stop_feed;
++	dvb_dev->demux.dmx.capabilities = DMX_TS_FILTERING |
++					DMX_SECTION_FILTERING |
++					DMX_MEMORY_BASED_FILTERING;
++
++	err = dvb_dmx_init(&dvb_dev->demux);
++	if (err < 0) {
++		dprintk(1, "dvb_dmx_init failed!\n");
++		kfree(dvb_dev);
++		return -1;
++	}
++
++	dvb_dev->dmxdev.filternum = dvb_dev->demux.filternum;
++	dvb_dev->dmxdev.demux = &dvb_dev->demux.dmx;
++	dvb_dev->dmxdev.capabilities = 0;
++
++	err = dvb_dmxdev_init(&dvb_dev->dmxdev, &dvb_dev->adapter);
++
++	if (err < 0) {
++		dprintk(1, "dvb_dmxdev failed!\n");
++		dvb_dmxdev_release(&dvb_dev->dmxdev);
++		kfree(dvb_dev);
++		return -1;
++	}
++
++	dvb_dev->udev = dev->udev;
++	dvb_dev->em28xx_dev = dev; /* FIXME get rid of this */
++
++	dev->dvb_dev = dvb_dev;
++
++	dvbdemux = &dvb_dev->demux;
++	dvb_net_init(&dvb_dev->adapter, &dvb_dev->dvbnet, &dvbdemux->dmx);
++
++	return 0;
++}
++
++static int em2880_dvb_fini(struct em28xx *dev)
++{
++	struct em2880_dvb *dvb_dev = dev->dvb_dev;
++	if (!dev) {
++		dprintk(1, "fini already called!\n");
++		return -1;
++	}
++	if (!dev->dvb_dev) {
++		dprintk(1, "dvb_dev not initialized!\n");
++		return -1;
++	}
++	dvb_dev = dev->dvb_dev;
++
++	dprintk(1, "releasing dvb device!\n");
++
++	dvb_net_release(&dvb_dev->dvbnet);
++	dvb_unregister_frontend(dvb_dev->frontend);
++	switch(dev->model) {
++	case EM2888_BOARD_TERRATEC_XS_HTC:
++		/* just kfree the dvb frontend template */
++		kfree(dvb_dev->frontend);
++		break;
++	default:
++		dvb_frontend_detach(dvb_dev->frontend);
++	}
++
++	dvb_dev->demux.dmx.close(&dvb_dev->demux.dmx);
++	dvb_dmxdev_release(&dvb_dev->dmxdev);
++	dvb_dmx_release(&dvb_dev->demux);
++
++	dvb_unregister_adapter(&dvb_dev->adapter);
++
++	dprintk(1, "dvb_fini\n");
++	if (dev->dvb_dev) {
++		dprintk(1, "freeing dvb_dev\n");
++		kfree(dev->dvb_dev);
++		dev->dvb_dev = NULL;
++	}
++	return 0;
++}
++
++static struct em28xx_ops dvb_ops = {
++	.id	= EM28XX_DVBT | EM28XX_ATSC | EM28XX_ISDB | EM28XX_DMB | EM28XX_DVBC,
++	.name	= "Em2880 DVB Extension",
++	.init	= em2880_dvb_init,
++	.fini	= em2880_dvb_fini,
++};
++
++static int __init em2880_dvb_register(void)
++{
++	return em28xx_register_extension(&dvb_ops);
++}
++
++static void __exit em2880_dvb_unregister(void)
++{
++	em28xx_unregister_extension(&dvb_ops);
++}
++
++module_init(em2880_dvb_register);
++module_exit(em2880_dvb_unregister);
++
++/* ------------------------------------------------------------------ */
++/*
++ * Local variables:
++ * c-basic-offset: 8
++ * End:
++ */
+diff -r 80a3bec444d3 em2880-dvb.c.orig
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/em2880-dvb.c.orig	Sun Mar 01 13:18:05 2009 -0500
+@@ -0,0 +1,1251 @@
++/*
++ *  Empiatech em2880 DVB-T extension
++ *
++ *  Copyright (C) 2006/2007/2008 Markus Rechberger <mrechberger@gmail.com>
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++ */
++
++#include <linux/init.h>
++#include <linux/list.h>
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/slab.h>
++#include <linux/delay.h>
++#include <linux/kthread.h>
++#include <linux/suspend.h>
++#include <linux/dvb/frontend.h>
++#include <linux/usb.h>
++#include <linux/version.h>
++
++#include <linux/init.h>
++#include <linux/list.h>
++#include <linux/module.h>
++
++#include "em28xx.h"
++
++#include <media/tuner.h>
++#include <media/v4l2-common.h>
++#include "dvb_frontend.h"
++
++#include "zl10353/zl10353.h"
++#include "mt352/mt352.h"
++#include "xc5000/xc5000_control.h"
++#include "drx3973d/drx3973d_demod.h"
++#include "lgdt3304/lgdt3304.h"
++#include "qt1010/qt1010.h"
++#include "mt2060/mt2060.h"
++#include "adimtv102/adimtv102.h"
++#include "tda18271/tda18271.h"
++
++#include "lgdt330x.h"
++#include "sharp/s921_module.h"
++
++#define EM2880_DVB_NUM_PACKETS 64
++#define EM2880_URB_COUNT 32
++
++#if defined DVB_DEFINE_MOD_OPT_ADAPTER_NR
++DVB_DEFINE_MOD_OPT_ADAPTER_NR(adapter_nr);
++#endif
++
++
++#define xc3028_offset_8mhz 2750000;
++#define xc3028_offset_7mhz 2250000;
++#define xc3028_offset_6mhz 2750000;
++#define xc3028_offset_atsc 1750000;
++
++
++MODULE_DESCRIPTION("Empiatech em2880 DVB-T extension");
++MODULE_AUTHOR("Markus Rechberger <mrechberger@gmail.com>");
++MODULE_LICENSE("GPL");
++
++
++DRX3973DData_t DRX3973DData_g = {
++	0,
++	0,
++	0,
++	0,
++	0,
++	0,
++	0,
++	0,
++	0,
++	0,
++	0,
++	0,
++	0,
++	0,
++	DRX_UIO_MODE_DISABLE,
++	DRX_UIO_MODE_DISABLE,
++	{
++		DRX3973D_AGC_CTRL_AUTO,
++		0,
++		0,
++		0,
++		0,
++		0
++	},
++	{
++		DRX3973D_AGC_CTRL_AUTO,
++		0,
++		0,
++		0,
++		0,
++		0
++	},
++	DRX3973D_IFFILTER_SAW,
++	FALSE,
++	DRX_BANDWIDTH_8MHZ,
++	FALSE,
++	DRX3973D_APPENV_PORTABLE,
++	TRUE,
++	FALSE,
++#ifndef _CH_
++	{
++		"01234567890",
++		"01234567890"
++	},
++	{
++		{
++			DRX_MODULE_UNKNOWN,
++			(char *)(NULL),
++			0,
++			0,
++			0,
++			(char *)(NULL)
++		},
++		{
++			DRX_MODULE_UNKNOWN,
++			(char *)(NULL),
++			0,
++			0,
++			0,
++			(char *)(NULL)
++		}
++	},
++	{
++		{
++			(pDRXVersion_t)(NULL),
++			(pDRXVersionList_t)(NULL)
++		},
++		{
++			(pDRXVersion_t)(NULL),
++			(pDRXVersionList_t)(NULL)
++		}
++	},
++	DRX3973D_SPIN_UNKNOWN,
++	{
++	},
++	FALSE,
++
++#if (DRXD_TYPE_B)
++	DRX3973D_I2C_INIT_ASEL
++#endif
++
++
++
++#endif
++};
++
++/**
++ * \var DRX3973DDefaultAddr_g
++ * \brief Default I2C address and device identifier.
++ */
++I2CDeviceAddr_t DRX3973DDefaultAddr_g = {
++#define DRX3973D_DEF_I2C_ADDR ((0xe0)>>1)
++	DRX3973D_DEF_I2C_ADDR,     /* i2c address */
++#define DRX3973D_DEF_DEMOD_DEV_ID   (1)
++	DRX3973D_DEF_DEMOD_DEV_ID,  /* device id */
++	NULL       /* private data structure */
++};
++
++/**
++ * \var DRX3973DDefaultCommAttr_g
++ * \brief Default common attributes of a drx3973d demodulator instance.
++ */
++DRXCommonAttr_t DRX3973DDefaultCommAttr_g = {
++	(pu8_t)NULL,
++	0,
++	TRUE,
++	4560,
++	48000L,
++	12000L,
++	0L,
++	FALSE,
++	TRUE,
++	TRUE,
++	TRUE,
++	FALSE,
++	FALSE,
++	FALSE,
++	FALSE,
++	FALSE,
++	FALSE,
++	32000000UL,
++	FALSE,
++	(pDRXScanParam_t)(NULL),
++	0,
++	0,
++	FALSE,
++	0L,
++	0L,
++	100,
++	DRX_LOCKED,
++	FALSE,
++	DRX_POWER_DOWN,
++	1,
++	0L,
++	0L
++};
++
++
++static unsigned int debug;
++module_param(debug, int, 0644);
++MODULE_PARM_DESC(debug, "em2880-dvb debug level (default off)");
++
++#define dprintk(lvl, fmt, args...) if (debug >= lvl) do {\
++		printk(fmt, ##args); \
++	} while (0)
++
++static int em2880_set_alternate(struct em2880_dvb *dvb_dev);
++
++/* ------------------------------------------------------------------ */
++
++/* FRONTEND TEMPLATE */
++
++
++
++static int em2880_fe_init(struct dvb_frontend *fe) {
++	return 0;
++}
++
++static int em2880_fe_sleep(struct dvb_frontend *fe) {
++	return 0;
++}
++
++static int em2880_fe_set_frontend(struct dvb_frontend *fe, struct dvb_frontend_parameters *param) {
++	return 0;
++}
++
++static int em2880_fe_get_frontend(struct dvb_frontend* fe, struct dvb_frontend_parameters *param) {
++	return 0;
++}
++
++static int em2880_fe_get_tune_settings(struct dvb_frontend *fe, struct dvb_frontend_tune_settings *tune_settings) {
++	tune_settings->min_delay_ms = 0;
++	tune_settings->step_size = 0;
++	tune_settings->max_drift = 0;
++	return 0;
++}
++
++static int em2880_fe_read_status(struct dvb_frontend *fe, fe_status_t *status) {
++	*status = FE_HAS_CARRIER | FE_HAS_VITERBI | FE_HAS_LOCK | FE_HAS_SYNC | FE_HAS_SIGNAL;
++	return 0;
++}
++
++static int em2880_fe_read_ber(struct dvb_frontend *fe, u32 *ber) {
++	return 0;
++}
++
++static int em2880_fe_read_signal_strength(struct dvb_frontend *fe, u16 *strength) {
++	return 0;
++}
++
++static int em2880_fe_read_snr(struct dvb_frontend *fe, u16 *snr) {
++	return 0;
++}
++
++static int em2880_fe_read_ucblocks(struct dvb_frontend *fe, u32 *ucblocks) {
++	return 0;
++}
++
++static void em2880_fe_release(struct dvb_frontend *fe) {
++}
++
++static struct dvb_frontend_ops em2880_fe_template_ops = {
++	.info = {
++		.name = "Empia Frontend Template",
++		.type = FE_QAM,
++		.frequency_min = 0,
++		.frequency_max = 900000000,
++		.frequency_stepsize = 1,
++		.symbol_rate_min = 0,
++		.symbol_rate_max = 10000000,
++		.symbol_rate_tolerance = 1,
++		.caps = 0
++	},
++	.init = em2880_fe_init,
++	.release = em2880_fe_release,
++
++	.sleep = em2880_fe_sleep,
++	.set_frontend = em2880_fe_set_frontend,
++	.get_frontend = em2880_fe_get_frontend,
++	.get_tune_settings = em2880_fe_get_tune_settings,
++	.read_status = em2880_fe_read_status,
++	.read_ber = em2880_fe_read_ber,
++	.read_signal_strength = em2880_fe_read_signal_strength,
++	.read_snr = em2880_fe_read_snr,
++	.read_ucblocks = em2880_fe_read_ucblocks
++};
++
++/* end frontend template */
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 19)
++static void em2880_complete_irq(struct urb *urb, struct pt_regs *ptregs)
++{
++#else
++static void em2880_complete_irq(struct urb *urb)
++{
++#endif
++	struct em2880_dvb *dvb_dev = urb->context;
++	int i;
++	int status;
++
++	if (dvb_dev == NULL) {
++		dprintk(1, "em2880-dev.c: device not valid!\n");
++		return;
++	}
++
++	if (debug && urb->status < 0) {
++		printk(KERN_ERR"%s:%u:%s(): status = %i\n", __FILE__,
++				__LINE__, __func__, urb->status);
++	}
++
++	switch (urb->status) {
++	case -ESHUTDOWN:
++		return;
++		break;
++	}
++
++	if (urb->status == -ENOENT)
++		return;
++
++	for (i = 0; i < urb->number_of_packets; i++) {
++		if (urb->iso_frame_desc[i].status != 0) {
++			dprintk(1, "em2880-dvb.c: status != 0\n");
++			continue;
++		} else if (urb->iso_frame_desc[i].actual_length > 0)
++			dvb_dmx_swfilter(&dvb_dev->demux,
++					urb->transfer_buffer +
++					urb->iso_frame_desc[i].offset,
++					urb->iso_frame_desc[i]
++					.actual_length);
++	}
++
++	status = usb_submit_urb(urb, GFP_ATOMIC);
++	if (status)
++		dprintk(1, "resubmitting urb failed!\n");
++}
++
++static void em2880_stop_stream(struct em2880_dvb *dvb_dev)
++{
++	int i;
++	int arg;
++	for (i = 0; i < EM2880_DVB_NUM_BUFS; i++) {
++		if (dvb_dev->urb[i]) {
++			usb_kill_urb(dvb_dev->urb[i]);
++			if (dvb_dev->transfer_buffer[i]) {
++				usb_buffer_free(dvb_dev->udev,
++						(EM2880_DVB_NUM_PACKETS *
++						 dvb_dev->dtv_packetsize),
++						dvb_dev->transfer_buffer[i],
++						dvb_dev->urb[i]->transfer_dma);
++			}
++			usb_free_urb(dvb_dev->urb[i]);
++		}
++		dvb_dev->urb[i] = NULL;
++		dvb_dev->transfer_buffer[i] = NULL;
++	}
++	arg = EM28XX_REG_OFF;
++	dvb_dev->em28xx_dev->em28xx_gpio_control(dvb_dev->em28xx_dev, EM28XX_LED1_ON, &arg);
++
++}
++
++static int em2880_start_stream(struct em2880_dvb *dvb_dev)
++{
++	int i, errCode;
++	int arg;
++	const int sb_size = EM2880_DVB_NUM_PACKETS * dvb_dev->dtv_packetsize;
++
++	dprintk(1, "em2880-dvb.c: got start stream request %s\n", __func__);
++	arg = EM28XX_REG_ON;
++	dvb_dev->em28xx_dev->em28xx_gpio_control(dvb_dev->em28xx_dev, EM28XX_LED1_ON, &arg);
++
++	em2880_set_alternate(dvb_dev);
++
++	/* allocate urbs */
++
++	for (i = 0; i < EM2880_DVB_NUM_BUFS; i++) {
++		struct urb *urb;
++		int j, k;
++		/* allocate transfer buffer */
++		urb = usb_alloc_urb(EM2880_DVB_NUM_PACKETS, GFP_KERNEL);
++		if (!urb) {
++			dprintk(1, "cannot alloc urb %i\n", i);
++			return -ENOMEM;
++		}
++		dvb_dev->transfer_buffer[i] =
++			usb_buffer_alloc(dvb_dev->udev, sb_size,
++					GFP_KERNEL, &urb->transfer_dma);
++
++		if (!dvb_dev->transfer_buffer[i]) {
++			dprintk(1, "unable to allocate %i bytes for transfer"
++				   "buffer %i\n", sb_size, i);
++
++			return -ENOMEM;
++		}
++		memset(dvb_dev->transfer_buffer[i], 0, sb_size);
++		urb->dev = dvb_dev->udev;
++		urb->context = dvb_dev;
++		urb->pipe = usb_rcvisocpipe(dvb_dev->udev, 0x84);
++		urb->transfer_flags = URB_ISO_ASAP;
++		urb->interval = 1;
++		urb->transfer_buffer = dvb_dev->transfer_buffer[i];
++		urb->complete = em2880_complete_irq;
++		urb->number_of_packets = EM2880_DVB_NUM_PACKETS;
++		urb->transfer_buffer_length = sb_size;
++		for (j = k = 0; j < EM2880_DVB_NUM_PACKETS;
++				j++, k += dvb_dev->dtv_packetsize) {
++			urb->iso_frame_desc[j].offset = k;
++			urb->iso_frame_desc[j].length =
++				dvb_dev->dtv_packetsize;
++		}
++		dvb_dev->urb[i] = urb;
++	}
++
++	/* submit urbs */
++	for (i = 0; i < EM2880_DVB_NUM_BUFS; i++) {
++		errCode = usb_submit_urb(dvb_dev->urb[i], GFP_KERNEL);
++		if (errCode) {
++			dprintk(1, "submit of urb %i failed (error=%i)\n",
++					i,
++					errCode);
++			return errCode;
++		}
++	}
++	return 0;
++}
++
++static int em2880_set_alternate(struct em2880_dvb *dvb_dev)
++{
++	int errCode;
++	errCode = usb_set_interface(dvb_dev->udev, dvb_dev->em28xx_dev->usb_interface, 1);
++
++	return errCode;
++}
++
++static int em2880_start_feed(struct dvb_demux_feed *dvbdmxfeed)
++{
++	struct dvb_demux *demux = dvbdmxfeed->demux;
++	struct em2880_dvb *dvb_dev = demux->priv;
++	dprintk(1, "em2880-dvb.c: got start feed request %s\n", __func__);
++
++	if (mutex_lock_interruptible(&dvb_dev->sem))
++		return -ERESTARTSYS;
++
++	if (dvb_dev->streaming == 0)
++		em2880_start_stream(dvb_dev);
++
++	dvb_dev->streaming++;
++	mutex_unlock(&dvb_dev->sem);
++	return 0;
++}
++
++static int em2880_stop_feed(struct dvb_demux_feed *dvbdmxfeed)
++{
++	struct dvb_demux *demux = dvbdmxfeed->demux;
++	struct em2880_dvb *dvb_dev = demux->priv;
++
++	dprintk(1, "em2880-dvb.c: got stop feed request %s\n", __func__);
++
++	if (mutex_lock_interruptible(&dvb_dev->sem))
++		return -ERESTARTSYS;
++	if (0 == --dvb_dev->streaming)
++		em2880_stop_stream(dvb_dev);
++	mutex_unlock(&dvb_dev->sem);
++	return 0;
++}
++
++static int em28xx_ts_bus_ctrl_int(struct em28xx *dev, int acquire)
++{
++	u8 gpio;
++	gpio = dev->em28xx_read_reg(dev, 04);
++	gpio &= ~((u8)0x3);
++
++	if (acquire == 1)
++		gpio |= 1;
++
++	return dev->em28xx_write_regs(dev, 0x04, &gpio, 1);
++}
++
++static int em28xx_ts_bus_ctrl(struct dvb_frontend *fe, int acquire)
++{
++	struct em28xx *dev = fe->dvb->priv;
++	return dev->em28xx_acquire(dev, EM28XX_DVBT, acquire);
++}
++
++static struct zl10353_config em2880_zl10353_dev = {
++	.demod_address = (0x1e >> 1),
++	.no_tuner = 1,
++	.parallel_ts = 1,
++	.if2 = 45600
++};
++
++struct bcode {
++	int reg;
++	char *txt;
++	int len;
++	int delay;
++};
++
++
++static int mt352_pinnacle_init(struct dvb_frontend *fe)
++{
++	int i;
++	struct bcode zlconf[] = {
++			{0x1e, "\x8a\x2c", 2, 0},
++			{0x1e, "\x89\x38", 2, 0},
++			{0x1e, "\x50\x80", 2, 0},
++			{0x1e, "\x8e\x40", 2, 0},
++			{0x1e, "\x69\x00", 2, 0},
++			{0x1e, "\x6a\xff", 2, 0},
++			{0x1e, "\x6b\xff", 2, 0},
++			{0x1e, "\x6c\x00", 2, 0},
++			{0x1e, "\x6d\xff", 2, 0},
++			{0x1e, "\x6e\x00", 2, 0},
++			{0x1e, "\x6f\x40", 2, 0},
++			{0x1e, "\x70\x40", 2, 0},
++			{0x1e, "\x68\xa0", 2, 0},
++
++			{0x1e, "\x56\x31", 2, 0},  /* set input frequency */
++			{0x1e, "\x57\xb8", 2, 0},
++			{0x1e, "\x75\x33", 2, 0},
++
++			{0x1e, "\x7c\x00", 2, 0},
++			{0x1e, "\x7d\x4d", 2, 0},
++			{0x1e, "\xb5\x7a", 2, 0},
++			{0x1e, "\x51\x40", 2, 0},
++			{0x1e, "\x52\x80", 2, 0},
++			{0x1e, "\x53\x50", 2, 0},
++			{0x1e, "\x5d\x01", 2, 0},
++			{}
++	};
++	for (i = 0; zlconf[i].txt; i++)
++		fe->ops.write(fe, zlconf[i].txt, zlconf[i].len);
++	return 0;
++}
++
++
++static struct mt352_config em2880_mt352_dev = {
++	.demod_address = (0x1e >> 1),
++	.no_tuner = 1,
++#if 0
++	.parallel_ts = 1,
++#endif
++	.if2 = 45600,
++	.demod_init = mt352_pinnacle_init,
++};
++
++
++static struct zl10353_config em2880_zl10353_pinnacle = {
++	.demod_address = (0x1e >> 1),
++	.no_tuner = 1,
++	.parallel_ts = 1,
++};
++
++static struct zl10353_config em2880_kworld_355u_dev = {
++	.demod_address = (0x1e >> 1),
++	.no_tuner = 1,
++	.parallel_ts = 1,
++};
++
++static struct lgdt330x_config em2880_lgdt3303_dev = {
++	.demod_address = 0x0e,
++	.demod_chip = LGDT3303
++};
++
++static struct mt2060_config em2870_mt2060_config = {
++	.i2c_address = 0x60
++};
++
++static struct qt1010_config em2870_qt1010_config = {
++	.i2c_address = 0x62
++};
++
++static int kworld355u_i2c_gate_ctrl(struct dvb_frontend *fe, int enable)
++{
++	struct zl10353_state {
++		struct i2c_adapter *i2c;
++		struct dvb_frontend frontend;
++
++		struct zl10353_config config;
++
++		enum fe_bandwidth bandwidth;
++	};
++	struct zl10353_state *state = fe->demodulator_priv;
++
++	struct em28xx *dev = state->i2c->algo_data;
++
++	return em28xx_ts_bus_ctrl_int(dev, enable);
++}
++
++static struct lgdt3304_config lgdt3304_atsc_config = {
++	.i2c_address = 0x0e
++};
++
++static int em28xx_set_params(struct dvb_frontend *fe,
++		struct dvb_frontend_parameters *params)
++{
++	struct em28xx *dev = fe->dvb->priv;
++	struct em2880_dvb *dvbdev = dev->dvb_dev;
++	int i;
++	unsigned long frequency = params->frequency;
++	struct dvb_ofdm_parameters *op = &params->u.ofdm;
++
++	if (!dev->tuner)
++		return -EINVAL;
++
++	switch (fe->ops.info.type) {
++	case FE_OFDM:
++		if (dev->dvbnorm->bandwidth !=
++				op->bandwidth) {
++			for (i = 0; dev->board->dvbnorms[i].tv_mode || dev->board->dvbnorms[i].index; i++) {
++				if (dev->board->dvbnorms[i].bandwidth == op->bandwidth) {
++					switch (dev->tuner_type) {
++					case TUNER_XCEIVE_XC3028:
++					{
++						struct xc3028_init_cmd cmd;
++						dvbdev->bw_index = i;
++						cmd.new_tv_mode_ptr = dev->board->dvbnorms[i].tv_mode;
++						cmd.new_channel_map_ptr = dev->board->dvbnorms[i].channelmap;
++						dev->dvbnorm = &dev->board->dvbnorms[i];
++						if (dev->tuner->tuner_cmd)
++							dev->tuner->tuner_cmd(dev->tuner, XC3028_INIT_TUNER, &cmd);
++						break;
++					}
++					case TUNER_XCEIVE_XC5000:
++					{
++						struct xc_std_conf cmd;
++						dvbdev->bw_index = i;
++						cmd.index = dev->board->dvbnorms[i].index;
++						dev->dvbnorm = &dev->board->dvbnorms[i];
++						dev->tuner->tuner_cmd(dev->tuner, XC5000_SET_MODE, &cmd);
++						break;
++					}
++					}
++					break;
++				}
++			}
++		}
++
++		if (dev->tuner->set_frequency) {
++			switch (params->u.ofdm.bandwidth) {
++			case BANDWIDTH_AUTO:
++			case BANDWIDTH_8_MHZ:
++				frequency -= xc3028_offset_8mhz;
++				break;
++			case BANDWIDTH_7_MHZ:
++				frequency -= xc3028_offset_7mhz;
++				break;
++			case BANDWIDTH_6_MHZ:
++				frequency -= xc3028_offset_6mhz;
++				break;
++			default:
++				return -EINVAL;
++			}
++			dev->tuner->set_frequency(dev->tuner, frequency);
++			dev->dctl_freq = frequency;
++		}
++		break;
++	case FE_QAM:
++		switch (dev->tuner_type) {
++		case TUNER_XCEIVE_XC3028:
++		{
++			struct xc3028_init_cmd cmd;
++			dvbdev->bw_index = 0;
++			cmd.new_tv_mode_ptr = dev->board->qamnorms[0].tv_mode;
++			cmd.new_channel_map_ptr = dev->board->qamnorms[0].channelmap;
++			dev->qamnorm = &dev->board->qamnorms[0];
++			if (dev->tuner->tuner_cmd)
++				dev->tuner->tuner_cmd(dev->tuner, XC3028_INIT_TUNER, &cmd);
++			break;
++		}
++		case TUNER_XCEIVE_XC5000:
++		{
++			struct xc_std_conf cmd;
++			dvbdev->bw_index = 0;
++			cmd.index = dev->board->atscnorms[0].index;
++			dev->atscnorm = &dev->board->atscnorms[0];
++			dev->tuner->tuner_cmd(dev->tuner, XC5000_SET_MODE, &cmd);
++			break;
++		}
++		}
++		frequency -= xc3028_offset_atsc;
++
++		dev->tuner->set_frequency(dev->tuner, frequency);
++		dev->dctl_freq = frequency;
++		break;
++	case FE_ATSC:
++		switch (dev->tuner_type) {
++		case TUNER_XCEIVE_XC3028:
++		{
++			struct xc3028_init_cmd cmd;
++			dvbdev->bw_index = 0;
++			cmd.new_tv_mode_ptr = dev->board->atscnorms[0].tv_mode;
++			cmd.new_channel_map_ptr = dev->board->atscnorms[0].channelmap;
++			dev->atscnorm = &dev->board->atscnorms[0];
++			if (dev->tuner->tuner_cmd)
++				dev->tuner->tuner_cmd(dev->tuner, XC3028_INIT_TUNER, &cmd);
++			break;
++		}
++		case TUNER_XCEIVE_XC5000:
++		{
++			struct xc_std_conf cmd;
++			dvbdev->bw_index = 0;
++			cmd.index = dev->board->atscnorms[0].index;
++			dev->atscnorm = &dev->board->atscnorms[0];
++			dev->tuner->tuner_cmd(dev->tuner, XC5000_SET_MODE, &cmd);
++			break;
++		}
++		}
++
++		frequency -= xc3028_offset_atsc;
++		dev->tuner->set_frequency(dev->tuner, frequency);
++		dev->dctl_freq = frequency;
++		break;
++	case FE_QPSK:
++		printk(KERN_INFO"FE_QPSK currently not supported\n");
++		break;
++	}
++
++	return 0;
++}
++
++static int em28xx_get_frequency(struct dvb_frontend *fe, u32 *frequency)
++{
++	struct em28xx *dev = fe->dvb->priv;
++	*frequency = dev->dctl_freq;
++	return 0;
++}
++
++static int em28xx_get_bandwidth(struct dvb_frontend *fe, u32 *bandwidth)
++{
++	struct em28xx *dev = fe->dvb->priv;
++	struct em2880_dvb *dvbdev = dev->dvb_dev;
++	*bandwidth = (u32)dev->board->dvbnorms[dvbdev->bw_index].bandwidth;
++	return 0;
++}
++
++static int em28xx_dvb_init(struct dvb_frontend *fe)
++{
++	struct em28xx *dev = fe->dvb->priv;
++	int gpio_arg;
++
++	printk(KERN_INFO"em28xx_dvb_init\n");
++
++	if (dev->mode != V4L2_TUNER_DIGITAL_TV) {
++		printk(KERN_INFO"switching over from %d\n", dev->mode);
++		gpio_arg = EM28XX_REG_OFF;
++		dev->em28xx_gpio_control(dev, EM28XX_ANALOG_ON,    &gpio_arg);
++
++		gpio_arg = EM28XX_REG_ON;
++		dev->em28xx_gpio_control(dev, EM28XX_TS1_ON,       &gpio_arg);
++		dev->em28xx_gpio_control(dev, EM28XX_TUNER1_ON,    &gpio_arg);
++		dev->em28xx_gpio_control(dev, EM28XX_DEMOD1_RESET, NULL);
++		mdelay(100);
++	}
++	dev->mode = V4L2_TUNER_DIGITAL_TV;
++	msleep(100);
++	switch (dev->tuner_type) {
++	case TUNER_XCEIVE_XC3028:
++	{
++		struct xc3028_init_cmd cmd;
++		if (dev->dev_modes & EM28XX_DVBT) {
++			cmd.new_tv_mode_ptr = dev->dvbnorm->tv_mode;
++			cmd.new_channel_map_ptr = dev->dvbnorm->channelmap;
++		} else if (dev->dev_modes & EM28XX_ATSC) {
++			cmd.new_tv_mode_ptr = dev->atscnorm->tv_mode;
++			cmd.new_channel_map_ptr = dev->atscnorm->channelmap;
++		}
++
++		if (dev->tuner && dev->tuner->tuner_cmd)
++			dev->tuner->tuner_cmd(dev->tuner, XC3028_INIT_TUNER, &cmd);
++		break;
++	}
++	case TUNER_XCEIVE_XC5000:
++	{
++		struct xc_std_conf cmd;
++		if (dev->dev_modes & EM28XX_DVBT)
++			cmd.index = dev->dvbnorm->index;
++		else if (dev->dev_modes & EM28XX_ATSC)
++			cmd.index = dev->atscnorm->index;
++
++		printk(KERN_INFO"initializing: %d\n", dev->dvbnorm->index);
++		dev->tuner->tuner_cmd(dev->tuner, XC5000_INIT_TUNER, NULL);
++
++		if (dev->tuner && dev->tuner->tuner_cmd)
++			dev->tuner->tuner_cmd(dev->tuner, XC5000_SET_MODE, &cmd);
++	}
++	}
++
++	return 0;
++}
++
++static int em28xx_s921_init(struct dvb_frontend *fe)
++{
++	struct em28xx *dev = fe->dvb->priv;
++	struct em2880_dvb *dvbdev = dev->dvb_dev;
++	switch (dev->em_type) {
++	case EM2875:
++		dev->em28xx_write_regs_req(dev, 0x00, 0x5f, "\x01", 1);
++		break;
++	default:
++		break;
++	}
++	if (dvbdev->init_override)
++		dvbdev->init_override(fe);
++
++	return 0;
++}
++
++static int em28xx_zl10353_init(struct dvb_frontend *fe)
++{
++	struct em28xx *dev = fe->dvb->priv;
++	struct em2880_dvb *dvbdev = dev->dvb_dev;
++
++	int gpio_arg;
++
++#if 0
++	if (dev->mode != V4L2_TUNER_DIGITAL_TV) {
++#endif
++		dev->em28xx_write_regs_req(dev, 0x00, 0x48, "\x00", 1);
++		dev->em28xx_write_regs_req(dev, 0x00, 0x12, "\x77", 1);
++
++		gpio_arg = EM28XX_REG_OFF;
++		dev->em28xx_gpio_control(dev, EM28XX_ANALOG_ON,    &gpio_arg);
++		gpio_arg = EM28XX_REG_ON;
++		dev->em28xx_gpio_control(dev, EM28XX_TS1_ON,       &gpio_arg);
++		dev->em28xx_gpio_control(dev, EM28XX_TUNER1_ON,    &gpio_arg);
++		dev->em28xx_gpio_control(dev, EM28XX_DECODER_SLEEP, &gpio_arg);
++		dev->em28xx_gpio_control(dev, EM28XX_DEMOD1_RESET, NULL);
++		mdelay(100);
++#if 0
++	}
++#endif
++	dev->mode = V4L2_TUNER_DIGITAL_TV;
++	msleep(100);
++
++	if (dvbdev->init_override)
++		dvbdev->init_override(fe);
++
++	switch (dev->em_type) {
++	case EM2888:
++		dev->em28xx_write_regs_req(dev, 0x00, 0x5f, "\x01", 1);
++		/* TODO move this to zl10353, though keep backward compatibility */
++		dev->em28xx_write_regs_req(dev, 0x02, 0x1e, "\x50\x0b", 2);
++		dev->em28xx_write_regs_req(dev, 0x02, 0x1e, "\x51\x64", 2);
++		break;
++	case EM2875:
++		dev->em28xx_write_regs_req(dev, 0x00, 0x5f, "\x01", 1);
++		break;
++	default:
++		dev->em28xx_write_regs_req(dev, 0x02, 0x1e, "\x50\x0b", 2);
++		dev->em28xx_write_regs_req(dev, 0x02, 0x1e, "\x51\x44", 2);
++		break;
++	}
++	return 0;
++}
++
++
++static int em28xx_zl10353_sleep(struct dvb_frontend *fe)
++{
++	struct em28xx *dev = fe->dvb->priv;
++#if 0
++	int gpio_arg = EM28XX_REG_OFF;
++#endif
++	if (dev->mode == V4L2_TUNER_DIGITAL_TV && dev->powersaving) {
++#if 0
++		dev->em28xx_gpio_control(dev, EM28XX_TS1_ON,       &gpio_arg);
++#endif
++		printk(KERN_INFO"powered down zl10353\n");
++	}
++	return 0;
++}
++
++
++static int em28xx_dvb_sleep(struct dvb_frontend *fe)
++{
++	struct em28xx *dev = fe->dvb->priv;
++#if 0
++	int gpio_arg;
++#endif
++	if (dev->mode == V4L2_TUNER_DIGITAL_TV && dev->powersaving) {
++#if 0
++		dev->tuner->shutdown(dev->tuner);
++#endif
++#if 0
++		gpio_arg = EM28XX_REG_OFF;
++		dev->em28xx_gpio_control(dev, EM28XX_TUNER1_ON,    &gpio_arg);
++		printk(KERN_INFO"powered down xc3028\n");
++#endif
++	}
++	return 0;
++}
++
++struct adimtv102_config dmbt_adim_config = {
++	.i2c_address = 0xc2>>1
++};
++
++struct s921_config sharp_isdbt_config = {
++	.i2c_address = 0x30>>1
++};
++
++static struct tda18271_config em2870_tda18271_config = {
++};
++
++static int em2880_dvb_init(struct em28xx *dev)
++{
++	struct em2880_dvb *dvb_dev;
++	int err;
++	u16 if1 = 1220;
++	int gpio_arg;
++	int i;
++	struct dvb_demux *dvbdemux;
++
++	printk(KERN_INFO"em2880-dvb.c: DVB Init\n");
++	if (NULL == dev) {
++		dprintk(1, "em2880-dvb.c: no device attached?\n");
++		return -ENOMEM;
++	}
++
++	dvb_dev = kzalloc(sizeof(struct em2880_dvb), GFP_KERNEL);
++	if (!dvb_dev) {
++		dprintk(1, "out of memory!\n");
++		return -ENOMEM;
++	}
++
++	mutex_init(&dvb_dev->sem);
++
++	dev->em28xx_write_regs_req(dev, 0x00, 0x48, "\x00", 1);
++	dev->em28xx_write_regs_req(dev, 0x00, 0x12, "\x77", 1);
++
++
++	if (dev->dvbnorm == NULL) {
++		kfree(dvb_dev);
++		return -EINVAL;
++	}
++
++	gpio_arg = EM28XX_REG_OFF;
++	dev->em28xx_gpio_control(dev, EM28XX_ANALOG_ON,    &gpio_arg);
++	gpio_arg = EM28XX_REG_ON;
++	dev->em28xx_gpio_control(dev, EM28XX_TS1_ON,       &gpio_arg);
++	dev->em28xx_gpio_control(dev, EM28XX_TUNER1_ON,    &gpio_arg);
++	dev->em28xx_gpio_control(dev, EM28XX_DECODER_SLEEP, &gpio_arg);
++	dev->em28xx_gpio_control(dev, EM28XX_DEMOD1_RESET, NULL);
++	mdelay(100);
++	dev->mode = V4L2_TUNER_DIGITAL_TV;
++
++
++	switch (dev->model) {
++	case EM2880_BOARD_HAUPPAUGE_WINTV_HVR_900_R2:
++	case EM2882_BOARD_PINNACLE_HYBRID_PRO:
++		dvb_dev->frontend = dvb_attach(drx3973d_attach,
++				&DRX3973DDefaultCommAttr_g,
++				&DRX3973DDefaultAddr_g,
++				&DRX3973DData_g,
++				&dev->i2c_adap);
++		break;
++	case EM2883_BOARD_TERRATEC_HYBRID_XS_FM:
++	case EM2880_BOARD_HAUPPAUGE_WINTV_HVR_900:
++	case EM2880_BOARD_TERRATEC_HYBRID_XS:
++	case EM2880_BOARD_TERRATEC_HYBRID_XS_FR:
++	case EM2882_BOARD_TERRATEC_HYBRID_XS:
++	case EM2882_BOARD_LEADTEK_PALMTOP_DTV_200H:
++	case EM2870_BOARD_TERRATEC_XS:
++	case EM2881_BOARD_PINNACLE_HYBRID_PRO:
++	case EM2881_BOARD_DNT_DA2_HYBRID:
++	case EM2880_BOARD_MSI_DIGIVOX_AD:
++	case EM2880_BOARD_MSI_DIGIVOX_AD_II:
++	case EM2870_BOARD_KWORLD_350U:
++	case EM2883_BOARD_KWORLD_HYBRID_E323:
++	case EM2888_BOARD_KWORLD_HYBRID_E329:
++	case EM2888_BOARD_EMPIA_HYBRID:
++	case EM2880_BOARD_TERRATEC_PRODIGY_XS:
++		dvb_dev->frontend = dvb_attach(zl10353_attach,
++				&em2880_zl10353_dev, &dev->i2c_adap);
++		if (dvb_dev->frontend == NULL)
++			dvb_dev->frontend = dvb_attach(mt352_attach,
++				&em2880_mt352_dev, &dev->i2c_adap);
++
++		break;
++	case EM2870_BOARD_TERRATEC_XS_MT2060:
++		dvb_dev->frontend = dvb_attach(zl10353_attach,
++				&em2880_zl10353_pinnacle, &dev->i2c_adap);
++		break;
++	case EM2883_BOARD_HAUPPAUGE_WINTV_HVR_950:
++	case EM2883_BOARD_PINNACLE_PCTV_HD_PRO:
++	case EM2883_BOARD_KWORLD_HYBRID_A316:
++	case EM2883_BOARD_ATI_TVWONDER600:
++		dvb_dev->frontend = dvb_attach(lgdt330x_attach,
++				&em2880_lgdt3303_dev, &dev->i2c_adap);
++		break;
++	case EM2870_BOARD_KWORLD_355U:
++	case EM2870_BOARD_COMPRO_VIDEOMATE:
++		em28xx_ts_bus_ctrl_int(dev, 0);
++		/* fall through */
++	case EM2870_BOARD_PINNACLE_PCTV_DVB:
++		dvb_dev->frontend = dvb_attach(zl10353_attach,
++				&em2880_kworld_355u_dev,
++				&dev->i2c_adap);
++		break;
++	case EM2883_BOARD_EMPIA_HYBRID_ATSC:
++	case EM2870_BOARD_KWORLD_340U:
++	case EM2883_BOARD_EQUINUX_TUBESTICK_ATSC:
++		dvb_dev->frontend = dvb_attach(lgdt3304_attach,
++				&lgdt3304_atsc_config, &dev->i2c_adap);
++		break;
++	case EM2875_BOARD_SAMPLE_ISDBT:
++
++#if 1
++		dvb_dev->frontend = dvb_attach(s921_attach,
++				&sharp_isdbt_config, &dev->i2c_adap);
++#endif
++		if (dvb_dev->frontend) {
++			dvb_dev->frontend->tuner_priv = dev;
++			dvb_dev->init_override = dvb_dev->frontend->ops.init;
++			dvb_dev->frontend->ops.init = em28xx_s921_init;
++		} else {
++			printk(KERN_ERR "failed to initialize s921\n");
++		}
++		break;
++	case EM2879_BOARD_SAMPLE_DMB:
++#if 0
++		dvb_dev->frontend = dvb_attach(dmb_attach,
++				&sharp_dmb_config, &dev->i2c_adap);
++#endif
++		break;
++	case EM2888_BOARD_TERRATEC_XS_HTC:
++	case EM28175_BOARD_EMPIA_HYBRID:
++	case EM2885_BOARD_EMPIA_DVBC:
++		dvb_dev->frontend = kzalloc(sizeof(struct dvb_frontend), GFP_KERNEL);
++		memcpy(&dvb_dev->frontend->ops, &em2880_fe_template_ops, sizeof(struct dvb_frontend_ops));
++		printk("em2880-dvb: registering DVB-T/C template device\n");
++		break;
++	default:
++		printk(KERN_INFO"em2880-dvb.c: unsupported device\n");
++		kfree(dvb_dev);
++		return -EINVAL;
++	}
++
++	if (dvb_dev->frontend && dev->model != EM2875_BOARD_SAMPLE_ISDBT && 
++                                 dev->model != EM2888_BOARD_TERRATEC_XS_HTC &&
++				 dev->model != EM2885_BOARD_EMPIA_DVBC &&
++				 dev->model != EM28175_BOARD_EMPIA_HYBRID) {
++		switch (dev->tuner_type) {
++		case TUNER_XCEIVE_XC3028:
++		case TUNER_XCEIVE_XC5000:
++			dvb_dev->frontend->tuner_priv = dev;
++			dvb_dev->frontend->ops.tuner_ops.set_params =
++				em28xx_set_params;
++			dvb_dev->frontend->ops.tuner_ops.get_frequency =
++				em28xx_get_frequency;
++			dvb_dev->frontend->ops.tuner_ops.get_bandwidth =
++				em28xx_get_bandwidth;
++
++			/* xc3028 powersaving mode */
++			dvb_dev->frontend->ops.tuner_ops.init =
++				em28xx_dvb_init;
++			dvb_dev->frontend->ops.tuner_ops.sleep =
++				em28xx_dvb_sleep;
++			break;
++		case TUNER_MT2060:
++			dvb_attach(mt2060_attach, dvb_dev->frontend,
++					&dev->i2c_adap, &em2870_mt2060_config,
++					if1);
++			break;
++		case TUNER_QT1010:
++			dvb_dev->frontend->ops.i2c_gate_ctrl =
++				kworld355u_i2c_gate_ctrl;
++			dvb_attach(qt1010_attach, dvb_dev->frontend,
++					&dev->i2c_adap, &em2870_qt1010_config);
++			break;
++		case TUNER_ADIMTV102:
++			dvb_attach(adimtv102_attach, dvb_dev->frontend, &dev->i2c_adap, &dmbt_adim_config);
++			break;
++		case TUNER_PHILIPS_TDA18271:
++				dvb_attach(tda18271_attach, dvb_dev->frontend, 0x60, &dev->i2c_adap, &em2870_tda18271_config);
++				break;
++		default:
++			printk(KERN_INFO"unsupported tuner (%d)\n",
++					dev->tuner_type);
++		}
++
++		/* zl10353 powersaving */
++		dvb_dev->init_override = dvb_dev->frontend->ops.init;
++
++		dvb_dev->frontend->ops.sleep = em28xx_zl10353_sleep;
++		dvb_dev->frontend->ops.init = em28xx_zl10353_init;
++	}
++
++	if (NULL == dvb_dev->frontend) {
++		printk(KERN_INFO"em2880-dvb.c: failed initializing zl10353"
++		       "DVB-T demodulator\n");
++		printk(KERN_INFO"em2880-dvb.c: retrying with mt352 DVB-T"
++				"demodulator\n");
++		if (NULL == dvb_dev->frontend) {
++			printk(KERN_INFO"em2880-dvb.c: no luck with mt352"
++			       "demodulator, not attaching em2880-dvb\n");
++			kfree(dvb_dev);
++			return -ENODEV;
++		}
++	}
++
++	/* this is not backward compatible */
++#if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 20)
++	dvb_dev->frontend->ops.ts_bus_ctrl = em28xx_ts_bus_ctrl;
++#endif
++
++	dvb_register_adapter(&dvb_dev->adapter, "em2880 DVB-T", THIS_MODULE,
++			&dev->udev->dev
++#if defined DVB_DEFINE_MOD_OPT_ADAPTER_NR
++			, adapter_nr
++#endif
++	);
++
++	for (i = 0; i < dev->uif->altsetting[1].desc.bNumEndpoints; i++) {
++		if (dev->uif->altsetting[1].endpoint[i].desc.bEndpointAddress == 0x84) {
++
++				//FIXME hack
++				 dev->uif->altsetting[1].endpoint[i].desc.wMaxPacketSize = cpu_to_le16(0x02f0);
++
++			dvb_dev->dtv_packetsize =
++				le16_to_cpu(dev->uif->altsetting[1].endpoint[i].
++				desc.wMaxPacketSize);
++			printk(" dtv_packetsize %d  0x%x\n", dvb_dev->dtv_packetsize, dvb_dev->dtv_packetsize);
++			break;
++		}
++	}
++
++	dvb_dev->adapter.priv = dev;
++
++	dvb_register_frontend(&dvb_dev->adapter, dvb_dev->frontend);
++
++	dvb_dev->demux.priv = dvb_dev;
++	dvb_dev->demux.filternum = 256;
++	dvb_dev->demux.feednum = 256;
++	dvb_dev->demux.start_feed = em2880_start_feed;
++	dvb_dev->demux.stop_feed = em2880_stop_feed;
++	dvb_dev->demux.dmx.capabilities = DMX_TS_FILTERING |
++					DMX_SECTION_FILTERING |
++					DMX_MEMORY_BASED_FILTERING;
++
++	err = dvb_dmx_init(&dvb_dev->demux);
++	if (err < 0) {
++		dprintk(1, "dvb_dmx_init failed!\n");
++		kfree(dvb_dev);
++		return -1;
++	}
++
++	dvb_dev->dmxdev.filternum = dvb_dev->demux.filternum;
++	dvb_dev->dmxdev.demux = &dvb_dev->demux.dmx;
++	dvb_dev->dmxdev.capabilities = 0;
++
++	err = dvb_dmxdev_init(&dvb_dev->dmxdev, &dvb_dev->adapter);
++
++	if (err < 0) {
++		dprintk(1, "dvb_dmxdev failed!\n");
++		dvb_dmxdev_release(&dvb_dev->dmxdev);
++		kfree(dvb_dev);
++		return -1;
++	}
++
++	dvb_dev->udev = dev->udev;
++	dvb_dev->em28xx_dev = dev; /* FIXME get rid of this */
++
++	dev->dvb_dev = dvb_dev;
++
++	dvbdemux = &dvb_dev->demux;
++	dvb_net_init(&dvb_dev->adapter, &dvb_dev->dvbnet, &dvbdemux->dmx);
++
++	return 0;
++}
++
++static int em2880_dvb_fini(struct em28xx *dev)
++{
++	struct em2880_dvb *dvb_dev = dev->dvb_dev;
++	if (!dev) {
++		dprintk(1, "fini already called!\n");
++		return -1;
++	}
++	if (!dev->dvb_dev) {
++		dprintk(1, "dvb_dev not initialized!\n");
++		return -1;
++	}
++	dvb_dev = dev->dvb_dev;
++
++	dprintk(1, "releasing dvb device!\n");
++
++	dvb_net_release(&dvb_dev->dvbnet);
++	dvb_unregister_frontend(dvb_dev->frontend);
++	switch(dev->model) {
++	case EM2888_BOARD_TERRATEC_XS_HTC:
++		/* just kfree the dvb frontend template */
++		kfree(dvb_dev->frontend);
++		break;
++	default:
++		dvb_frontend_detach(dvb_dev->frontend);
++	}
++
++	dvb_dev->demux.dmx.close(&dvb_dev->demux.dmx);
++	dvb_dmxdev_release(&dvb_dev->dmxdev);
++	dvb_dmx_release(&dvb_dev->demux);
++
++	dvb_unregister_adapter(&dvb_dev->adapter);
++
++	dprintk(1, "dvb_fini\n");
++	if (dev->dvb_dev) {
++		dprintk(1, "freeing dvb_dev\n");
++		kfree(dev->dvb_dev);
++		dev->dvb_dev = NULL;
++	}
++	return 0;
++}
++
++static struct em28xx_ops dvb_ops = {
++	.id	= EM28XX_DVBT | EM28XX_ATSC | EM28XX_ISDB | EM28XX_DMB | EM28XX_DVBC,
++	.name	= "Em2880 DVB Extension",
++	.init	= em2880_dvb_init,
++	.fini	= em2880_dvb_fini,
++};
++
++static int __init em2880_dvb_register(void)
++{
++	return em28xx_register_extension(&dvb_ops);
++}
++
++static void __exit em2880_dvb_unregister(void)
++{
++	em28xx_unregister_extension(&dvb_ops);
++}
++
++module_init(em2880_dvb_register);
++module_exit(em2880_dvb_unregister);
++
++/* ------------------------------------------------------------------ */
++/*
++ * Local variables:
++ * c-basic-offset: 8
++ * End:
++ */
+diff -r 80a3bec444d3 em28xx-cards.c
+--- a/em28xx-cards.c	Thu Feb 05 09:48:48 2009 +0100
++++ b/em28xx-cards.c	Sun Mar 01 13:18:05 2009 -0500
+@@ -2454,8 +2454,8 @@
+ 		.dvbnorms	= EETI_XC3028_DEFAULT_DVBT,
+ #endif
+ 	},
+-	[EM2883_BOARD_KWORLD_A340] = {
+-		.name         = "KWorld ATSC 340",
++	[EM2870_BOARD_KWORLD_340U] = {
++		.name         = "KWorld ATSC 340U",
+ 		.tuner_type   = TUNER_PHILIPS_TDA18271,
+ 		.dev_modes    = EM28XX_ATSC,
+ 	},
+@@ -2701,7 +2701,7 @@
+ 	{ USB_DEVICE(0xeb1a, 0x2860), .driver_info = EM2860_BOARD_GENERIC },
+ 	{ USB_DEVICE(0xeb1a, 0x2861), .driver_info = EM2861_BOARD_GENERIC },
+ 	{ USB_DEVICE(0xeb1a, 0x2881), .driver_info = EM2881_BOARD_GENERIC },
+-	{ USB_DEVICE(0xeb1a, 0x2870), .driver_info = EM2870_BOARD_GENERIC },
++	//{ USB_DEVICE(0xeb1a, 0x2870), .driver_info = EM2870_BOARD_GENERIC },
+ 	{ USB_DEVICE(0xeb1a, 0xe310), .driver_info = EM2880_BOARD_MSI_DIGIVOX_AD },
+ 	{ USB_DEVICE(0xeb1a, 0xe320), .driver_info = EM2880_BOARD_MSI_DIGIVOX_AD_II },
+ 	{ USB_DEVICE(0xeb1a, 0xe300), .driver_info = EM2861_BOARD_KWORLD_PVRTV_300U },
+@@ -2748,6 +2748,8 @@
+ 	{ USB_DEVICE(0xeb1a, 0xe306), .driver_info = EM2883_BOARD_KWORLD_HYBRID_F306 }, /* development only */
+ 	{ USB_DEVICE(0x1b80, 0xe329), .driver_info = EM2888_BOARD_KWORLD_HYBRID_E329 },
+ 	{ USB_DEVICE(0xeb1a, 0x2889), .driver_info = EM2888_BOARD_EMPIA_HYBRID },
++	{ USB_DEVICE(0x1b80, 0xa340), .driver_info = EM2870_BOARD_KWORLD_340U },
++	//{ USB_DEVICE(0xeb1a, 0x2870), .driver_info = EM2870_BOARD_KWORLD_340U },
+ 	{ USB_DEVICE(0xeb1a, 0xe323), .driver_info = EM2883_BOARD_KWORLD_HYBRID_E323 },
+ 	{ USB_DEVICE(0xeb1a, 0xa139), .driver_info = EM2888_BOARD_LINCOLN_TV_FM },
+ #if 0
+@@ -3020,6 +3022,53 @@
+ 		mdelay(70);
+ 		break;
+ 	}
++	case EM2870_BOARD_KWORLD_340U:
++	{
++		ret = em28xx_write_regs(dev, R0F_XCLK_REG, "\x07", 1);  /* protocol? */
++		if (ret < 0)
++			return ret;
++		ret = em28xx_write_regs(dev, R06_I2C_CLK_REG, "\x4c", 1);
++		if (ret < 0)
++			return ret;
++		ret = em28xx_write_regs(dev, 0x08, "\xfe", 1);
++		if (ret < 0)
++			return ret;
++#if 0  //FIXME wtf reg 0x04 ????
++		ret = em28xx_write_regs(dev, 0x04, "\xde", 1);
++		if (ret < 0)
++			return ret;
++		ret = em28xx_write_regs(dev, 0x04, "\xfe", 1);
++		if (ret < 0)
++			return ret;
++#endif
++		ret = em28xx_write_regs(dev, 0x08, "\xde", 1);
++		if (ret < 0)
++			return ret;
++		ret = em28xx_write_regs(dev, 0x08, "\xfe", 1);
++		if (ret < 0)
++			return ret;
++		/////////////////////
++
++
++		ret = em28xx_write_regs(dev, 0x08, "\xfd", 1);
++		if (ret < 0)
++			return ret;
++		ret = em28xx_write_regs(dev, 0x08  /* wtf 0x04*/ , "\xff", 1);
++		if (ret < 0)
++			return ret;
++		ret = em28xx_write_regs(dev, 0x08, "\xfd", 1);
++		if (ret < 0)
++			return ret;
++		ret = em28xx_write_regs(dev, 0x08  /* wtf 0x04 */, "\xff", 1);
++		if (ret < 0)
++			return ret;
++		ret = em28xx_write_regs(dev, 0x08, "\xfd", 1);
++		if (ret < 0)
++			return ret;
++
++
++		break;
++	}
+ 	case EM2870_BOARD_KWORLD_350U:
+ 	{
+ 		ret = em28xx_write_regs(dev, R0F_XCLK_REG, "\x27", 1);
+@@ -3241,6 +3290,22 @@
+ 		ret = em28xx_write_regs_req(dev, 0x00, 0x08, "\xfd", 1);
+ 		if (ret < 0)
+ 			return ret;
++
++		/* enable audio 12 mhz i2s */
++		ret = em28xx_write_regs(dev, 0x0f, "\xa7", 1);
++		dev->i2s_speed = 2048000;
++
++		if (dev->has_msp34xx) {
++			/* Send a reset to the other chips via gpio */
++			ret = em28xx_write_regs_req(dev, 0x00, 0x08, "\xf7", 1);
++			if (ret < 0)
++				return ret;
++			udelay(2500);
++			ret = em28xx_write_regs_req(dev, 0x00, 0x08, "\xff", 1);
++			if (ret < 0)
++				return ret;
++			udelay(2500);
++		}
+ 		break;
+ 	}
+ 	case EM2888_BOARD_KWORLD_HYBRID_E329:
+diff -r 80a3bec444d3 em28xx-core.c
+--- a/em28xx-core.c	Thu Feb 05 09:48:48 2009 +0100
++++ b/em28xx-core.c	Sun Mar 01 13:18:05 2009 -0500
+@@ -437,7 +437,7 @@
+ 		s[0] = 0x05;
+ 		s[1] = 0x05;
+ 		break;
+-	case EM2861_BOARD_PLEXTOR_PX_TV100U:
++		//case EM2861_BOARD_PLEXTOR_PX_TV100U:
+ 	case EM2860_BOARD_GADMEI_UTV330:
+ 		switch (dev->ctl_ainput) {
+ 		case 0:
+diff -r 80a3bec444d3 em28xx-i2c.c
+--- a/em28xx-i2c.c	Thu Feb 05 09:48:48 2009 +0100
++++ b/em28xx-i2c.c	Sun Mar 01 13:18:05 2009 -0500
+@@ -576,6 +576,8 @@
+ 	struct em28xx_eeprom *em_eeprom = (void *)eedata;
+ 	int i, err, size = len, block;
+ 
++	//printk("eeprom\n");
++
+ 	dev->i2c_client.addr = 0xa0 >> 1;
+ 
+ 	/* Check if board has eeprom */
+@@ -618,7 +620,8 @@
+ 			printk(KERN_CONT "\n");
+ 	}
+ 
+-	printk(KERN_INFO "EEPROM ID= 0x%08x\n", em_eeprom->id);
++	//printk(KERN_INFO "EEPROM ID= 0x%08x\n", em_eeprom->id);
++	printk("EEPROM ID= 0x%08x\n", em_eeprom->id);
+ 	printk(KERN_INFO "Vendor/Product ID= %04x:%04x\n",
+ 			em_eeprom->vendor_ID, em_eeprom->product_ID);
+ 
+@@ -843,6 +846,8 @@
+ 		dprintk1(1, "attach_inform: zl10353 demodulator found!\n");
+ 		break;
+ 	default:
++		//em28xx_i2c_eeprom(dev, client, dev->eedata,
++		//		sizeof(dev->eedata));
+ 		dprintk1(1, "attach_inform: (default): "
+ 			"detected I2C address %x\n", client->addr << 1);
+ 		dev->tuner_addr = client->addr;
+@@ -901,6 +906,7 @@
+ 	[0xc2 >> 1] = "tuner (analog)",
+ 	[0xc4 >> 1] = "tuner (analog)",
+ 	[0xc6 >> 1] = "tuner (analog)",
++	[0x1c >> 1] = "lgdt3304",
+ 	[0x1e >> 1] = "zl10353/mt352 dvb-t demodulator",
+ };
+ 
+@@ -934,6 +940,90 @@
+ }
+ EXPORT_SYMBOL(em28xx_i2c_call_clients);
+ 
++#if 0
++static void fix_eeprom (struct i2c_client *client)
++{
++	unsigned char buffer[2];
++	/* 00: 1a eb 67 95 80 1b 40 a3 */
++	unsigned char newValues[] = { '\x1a', '\xeb', '\x67', '\x95', '\x80', '\x1b', '\x40', '\xa3' };
++	int i;
++	int ret;
++
++	client->addr = 0xa0 >> 1;
++
++	for (i = 0;  i < 8;  i++) {
++		buffer[0] = i;  /* sub address */
++		buffer[1] = newValues[i];
++
++		mdelay(200);  /* need some type of delay */
++
++		ret = i2c_master_send(client, buffer, 2);
++		if (ret != 2) {
++			printk("eeprom write failed\n");
++		}
++	}
++}
++#endif
++
++static void print_eeprom (struct i2c_client *client, int len)
++{
++	unsigned char eedata[256];
++	unsigned char *p = eedata;
++	unsigned char buf;
++	int err;
++	int block;
++	int size = len;
++	int i;
++
++	client->addr = 0xa0 >> 1;
++
++	/* check if board has eeprom */
++	err = i2c_master_recv(client, &buf, 0);
++	if (err < 0) {
++		printk("board doesn't have eeprom\n");
++		return;
++	}
++
++	buf = 0;
++	err = i2c_master_send(client, &buf, 1);
++	if (err != 1) {
++		printk("Huh, no eeprom present (err=%d)?\n", err);
++		return;
++	}
++
++	while (size > 0) {
++		if (size > 16)
++			block = 16;
++		else
++			block = size;
++		if (block != (err = i2c_master_recv(client, p, block))) {
++			printk("i2c eeprom read error (%d)\n", err);
++			return;
++		}
++		size -= block;
++		p += block;
++	}
++
++#if 0
++	err = i2c_master_recv(client, eedata, len);
++	if (err != len) {
++		printk("i2c eeprom read error (err=%d)\n", err);
++		return;
++	}
++#endif
++
++	if (1) {
++		printk("full 256-byte eeprom dump:\n");
++		for (i = 0; i < len; i++) {
++			if (0 == (i % 16))
++				printk("%02x:", i);
++			printk(" %02x", eedata[i]);
++			if (15 == (i % 16))
++				printk("\n");
++		}
++	}
++}
++
+ /*
+  * em28xx_i2c_register()
+  * register i2c bus
+@@ -953,6 +1043,31 @@
+ 
+ 	if (i2c_scan || dev->dev_modes == 0)
+ 		do_i2c_scan(dev->name, &dev->i2c_client);
++
++		printk("eeprom\n");
++#if 0
++		//em28xx_i2c_eeprom(dev, client, dev->eedata,
++		//		sizeof(dev->eedata));
++		{
++			int i;
++			int len;
++
++			len = sizeof(dev->eedata);
++
++	for (i = 0; i < len; i++) {
++		if (0 == (i % 16))
++			printk("%s: i2c eeprom %02x:",
++					dev->name, i);
++		//printk(" %02x", eedata[i]);
++		printk(" %02x", dev->eedata[i]);
++
++		if (15 == (i % 16))
++			printk(KERN_CONT "\n");
++	}
++		}
++#endif
++		//print_eeprom(&dev->i2c_client, sizeof(dev->eedata));
++		//fix_eeprom(&dev->i2c_client);
+ 	return 0;
+ }
+ 
+diff -r 80a3bec444d3 em28xx-video.c
+--- a/em28xx-video.c	Thu Feb 05 09:48:48 2009 +0100
++++ b/em28xx-video.c	Sun Mar 01 13:18:05 2009 -0500
+@@ -2205,6 +2205,7 @@
+ 		}
+ 
+ 		if (dev->decoder == EM28XX_TVP5150) {
++			em28xx_set_ctrl(dev, ctrl);
+ 			em28xx_i2c_call_clients(dev, cmd, arg);
+ 			return 0;
+ 		} else if (!dev->has_msp34xx) {
+diff -r 80a3bec444d3 em28xx.h
+--- a/em28xx.h	Thu Feb 05 09:48:48 2009 +0100
++++ b/em28xx.h	Sun Mar 01 13:18:05 2009 -0500
+@@ -121,7 +121,7 @@
+ #define EM2883_BOARD_KWORLD_HYBRID_F306		  65
+ #define EM2888_BOARD_KWORLD_HYBRID_E329		  66
+ #define EM2883_BOARD_KWORLD_HYBRID_E323		  67
+-#define EM2883_BOARD_KWORLD_A340		  68
++#define EM2870_BOARD_KWORLD_340U		  68
+ #define EM2888_BOARD_LINCOLN_TV_FM		  69
+ #define EM2888_BOARD_DVB_TC_HYBRID		  70
+ #define EM2888_BOARD_EMPIA_HYBRID                 71
+diff -r 80a3bec444d3 lgdt3304/lgdt3304.c
+--- a/lgdt3304/lgdt3304.c	Thu Feb 05 09:48:48 2009 +0100
++++ b/lgdt3304/lgdt3304.c	Sun Mar 01 13:18:05 2009 -0500
+@@ -118,6 +118,25 @@
+ 	return 0;
+ }
+ 
++#if 1
++static void print_regs(struct dvb_frontend *fe)
++{
++	int r050a;
++	int r011b;
++	int r011c;
++	int r0001;
++
++	r050a = lgdt3304_i2c_read_reg(fe, 0x050a);
++	r011b = lgdt3304_i2c_read_reg(fe, 0x011b);
++	r011c = lgdt3304_i2c_read_reg(fe, 0x011c);
++	r0001 = lgdt3304_i2c_read_reg(fe, 0x0001);
++
++	//dprintk("read snr\n");
++	printk("050a: %x  011b: %x  011c: %x  0001: %x\n", r050a, r011b, r011c, r0001);
++	//printk("011b :  0x%x\n", r011b);
++	//printk("011c :  0x%x\n", r011c);
++}
++#endif
+ 
+ static int lgdt3304_soft_Reset(struct dvb_frontend *fe)
+ {
+@@ -132,6 +151,7 @@
+ {
+ 	int err = 0;
+ 
++#if 0
+ 	static __u8 lgdt3304_vsb8_data[] = {
+ 		/* 16bit  , 8bit */
+ 		/* regs   , val  */
+@@ -157,7 +177,43 @@
+ 		0x03, 0x14, 0xe1,
+ 		0x05, 0x0e, 0x5b,
+ 	};
++#endif
+ 
++	/* tested with kworld atsc 340u */
++	static __u8 lgdt3304_vsb8_data[] = {
++		0x00, 0x00, 0x03,
++		0x00, 0x0d, 0x02,
++		0x00, 0x0e, 0x02,
++		0x00, 0x12, 0x32,
++		0x00, 0x13, 0xc4,
++		0x01, 0x12, 0x17,
++		0x01, 0x13, 0x15,
++		0x01, 0x14, 0x18,
++		0x01, 0x15, 0xff,
++		0x01, 0x16, 0xbc,
++		0x02, 0x14, 0x67,
++		0x04, 0x24, 0x8d,
++		0x04, 0x27, 0x12,
++		0x04, 0x28, 0x4f,
++		0x03, 0x08, 0x80,
++		0x03, 0x09, 0x00,
++		0x03, 0x0d, 0x14,
++		0x03, 0x0e, 0x1c,
++		0x03, 0x14, 0xe1,
++		/* 0x00, 0x02, 0x9b, */
++		/* 0x00, 0x02, 0x9a, */
++		0x01, 0x06, 0x4f,
++		0x01, 0x07, 0x0c,
++		0x01, 0x08, 0xac,
++		0x01, 0x09, 0xba,
++		0x01, 0x26, 0xf9,
++		0x00, 0x0d, 0x82,
++		0x05, 0x0e, 0x5b,
++		0x05, 0x0e, 0x5b,
++
++	};
++
++#if 0
+ 	/* not yet tested .. */
+ 	static __u8 lgdt3304_qam64_data[] = {
+ 		/* 16bit  , 8bit */
+@@ -177,6 +233,7 @@
+ 		0x03, 0x0b, 0x9b,
+ 		0x05, 0x0e, 0x5b,
+ 	};
++#endif
+ 
+ #if 0
+ 	/* not yet tested */
+@@ -199,43 +256,10 @@
+ 	};
+ #endif
+ 
+-	/* tested with KWorld a340 */
++	/* tested with kworld atsc 340u */
+ 	static __u8 lgdt3304_qam256_data[] = {
+ 		/* 16bit  , 8bit */
+ 		/* regs   , val  */
+-		0x00, 0x00, 0x01,  /* 0x19, */
+-		0x00, 0x12, 0x2a,
+-		0x00, 0x13, 0x80,
+-		0x00, 0x0d, 0x02,
+-		0x03, 0x14, 0xe3,
+-
+-		0x03, 0x0e, 0x1c,
+-		0x03, 0x08, 0x66,
+-		0x03, 0x09, 0x66,
+-		0x03, 0x0a, 0x08,
+-		0x03, 0x0b, 0x9b,
+-
+-		0x03, 0x0d, 0x14,
+-#if 0
+-		0x05, 0x0e, 0x5b,
+-#endif
+-		0x01, 0x06, 0x4a,
+-		0x01, 0x07, 0x3d,
+-		0x01, 0x08, 0x70,
+-		0x01, 0x09, 0xa3,
+-
+-		0x05, 0x04, 0xfd,
+-
+-		0x00, 0x0d, 0x82,
+-
+-		0x05, 0x0e, 0x5b,
+-
+-		0x05, 0x0e, 0x5b,
+-
+-		0x00, 0x02, 0x9a,
+-
+-		0x00, 0x02, 0x9b,
+-
+ 		0x00, 0x00, 0x01,
+ 		0x00, 0x12, 0x2a,
+ 		0x00, 0x13, 0x80,
+@@ -259,9 +283,15 @@
+ 		0x00, 0x0d, 0x82,
+ 
+ 		0x05, 0x0e, 0x5b,
++
++		0x05, 0x0e, 0x5b,
+ 	};
+ 
+ 	struct lgdt3304_state *state = fe->demodulator_priv;
++
++	//printk("lgdt set param\n");
++	//print_regs(fe);
++
+ 	if (state->current_modulation != param->u.vsb.modulation) {
+ 		switch (param->u.vsb.modulation) {
+ 		case VSB_8:
+@@ -269,12 +299,16 @@
+ 					sizeof(lgdt3304_vsb8_data));
+ 			break;
+ 		case QAM_64:
++			printk("%s qam64 not tested yet\n", __func__);
++#if 0
+ 			err = i2c_write_demod_bytes(fe, lgdt3304_qam64_data,
+ 					sizeof(lgdt3304_qam64_data));
++#endif
+ 			break;
+ 		case QAM_256:
+ 			err = i2c_write_demod_bytes(fe, lgdt3304_qam256_data,
+ 					sizeof(lgdt3304_qam256_data));
++			//printk("qam256 set\n");
+ 			break;
+ 		default:
+ 			break;
+@@ -308,18 +342,40 @@
+ }
+ 
+ 
++/*
++ 050a: 6f  011b: 4  011c: 7 WABC+
++
++050a: 0x0d  generates dvbtraffic
++
++*/
++
+ static int lgdt3304_read_status(struct dvb_frontend *fe, fe_status_t *status)
+ {
+ 	struct lgdt3304_state *state = fe->demodulator_priv;
++	int r050a;
+ 	int r011d;
+ 	int qam_lck;
+ 
+ 	*status = 0;
+ 	dprintk("lgdt read status\n");
+ 
++	//print_regs(fe);
++
++	// 60, e0, 61, 67, 63
++	/*
++030610:                1c 03 lgdt3304  >>>  01 1d
++030611:                R05_I2C_STATUS       00
++030612:                1c 02 lgdt3304       e0
++030613:                R05_I2C_STATUS       00
++030614:                1c 03 lgdt3304  >>>  04 09
++030615:                R05_I2C_STATUS       00
++030616:                1c 02 lgdt3304       07
++	*/
++
++	//r050a = lgdt3304_i2c_read_reg(fe, 0x050a);
+ 	r011d = lgdt3304_i2c_read_reg(fe, 0x011d);
+ 
+-	dprintk("%02x\n", r011d);
++	dprintk("0x%02x\n", r011d);
+ 
+ 	switch (state->current_modulation) {
+ 	case VSB_8:
+@@ -333,7 +389,14 @@
+ 		break;
+ 	case QAM_64:
+ 	case QAM_256:
++		/*
++		   0x78,    0x7f
++		   0x78,    0x7b,   0x7f
++		   0x79
++		   0x78 -- all 0 signal
++		 */
+ 		qam_lck = r011d & 0x7;
++#if 0
+ 		switch (qam_lck) {
+ 		case 0x0:
+ 			dprintk("Unlock\n");
+@@ -347,14 +410,33 @@
+ 		case 0x7:
+ 			dprintk("Final Lock in good reception state\n");
+ 			*status |= FE_HAS_CARRIER;
+-			*status |= FE_HAS_LOCK;
++			//*status |= FE_HAS_LOCK;
+ 			*status |= FE_HAS_SYNC;
+ 			*status |= FE_HAS_SIGNAL;
++
++			if (r050a == 0x6f  ||  r050a == 0x5f) {  // also 0x5f generates dvb traffic
++				*status |= FE_HAS_LOCK;
++			}
+ 			break;
+ 		}
++#endif
++		if (qam_lck & 0x1) {
++			*status |= FE_HAS_SIGNAL;
++		}
++		if (qam_lck & 0x2) {
++			*status |= FE_HAS_CARRIER;
++		}
++		if (qam_lck & 0x4) {
++			*status |= FE_HAS_SYNC;
++		}
++		if (qam_lck & 0x7) {
++			if (1) {  //(r050a == 0x6f  ||  r050a == 0x5f) {  // these genereate output with dvbtraffic
++				*status |= FE_HAS_LOCK;
++			}
++		}
+ 		break;
+ 	default:
+-		printk(KERN_ERR "%s unhandled modulation\n", __func__);
++		printk(KERN_ERR "%s unhandled modulation %d\n", __func__, state->current_modulation);
+ 	}
+ 
+ 
+@@ -363,19 +445,90 @@
+ 
+ static int lgdt3304_read_ber(struct dvb_frontend *fe, __u32 *ber)
+ {
+-	dprintk("read ber\n");
++	int r011c;
++
++	//dprintk("read ber\n");
++	//r011c = lgdt3304_i2c_read_reg(fe, 0x011c);
++	//*ber = r011c;
++
++	*ber = 0;
++
++	return 0;
++}
++
++static int lgdt3304_read_signal_strength(struct dvb_frontend *fe, __u16 *strength)
++{
++	int r050a;
++	//dprintk("read snr\n");
++	//print_regs(fe);
++	//r050a = lgdt3304_i2c_read_reg(fe, 0x050a);
++	//*strength = r050a;
++	*strength = 0xffff;
++
+ 	return 0;
+ }
+ 
+ static int lgdt3304_read_snr(struct dvb_frontend *fe, __u16 *snr)
+ {
++	int r011b;
++	int r011c;
++
+ 	dprintk("read snr\n");
++
++
++	//print_regs(fe);
++
++	//r011b = lgdt3304_i2c_read_reg(fe, 0x011b);
++	//r011c = lgdt3304_i2c_read_reg(fe, 0x011c);
++
++	//*snr = 0xffff - ((r011b << 8) | r011c);
++	//*snr = r011b;
++	*snr = 0xffff;
++
++	/*
++002658:                1c 03 lgdt3304  >>>  05 0a
++002659:                R05_I2C_STATUS       00
++002660:                1c 02 lgdt3304       6f
++002661:                R05_I2C_STATUS       00
++002662:                1c 03 lgdt3304  >>>  01 1b
++###  002663:  ISOCH_TRANSFER - (not parsed)
++002664:                R05_I2C_STATUS       00
++002665:                1c 02 lgdt3304       00
++002666:                R05_I2C_STATUS       00
++002667:                1c 03 lgdt3304  >>>  01 1c
++002668:                R05_I2C_STATUS       00
++002669:                1c 02 lgdt3304       b9
++002670:                R05_I2C_STATUS       00
++
++2008-04-16 09:02:00.381 ERROR PropSet->Set() failed... hr=80070492
++2008-04-16 09:02:01.013 VERBOSE ServiceID: -1, PMT PID: -1, VPID: -1, APID: -1
++2008-04-16 09:02:01.013 VERBOSE SubmitTuningRequest() complete
++2008-04-16 09:02:01.013 VERBOSE ScanTransponder@2
++2008-04-16 09:02:01.117 VERBOSE ScanTransponder@2
++2008-04-16 09:02:01.154 VERBOSE locked=1 present=1 strength=35250 quality=89
++2008-04-16 09:02:01.155 VERBOSE ScanTransponder@4
++2008-04-16 09:02:01.155 VERBOSE ScanTransponder@5
++2008-04-16 09:02:01.155 VERBOSE ScanTransponder@6
++2008-04-16 09:02:01.155 VERBOSE locked=1 present=1 strength=35250 quality=89
++2008-04-16 09:02:01.156 VERBOSE SIGNAL???
++2008-04-16 09:02:01.156 VERBOSE ScanTransponder finished
++
++	*/
++
+ 	return 0;
+ }
+ 
+ static int lgdt3304_read_ucblocks(struct dvb_frontend *fe, __u32 *ucblocks)
+ {
+-	dprintk("read ucblocks\n");
++	int r011d;
++
++	//dprintk("read ucblocks\n");
++	//r011d = lgdt3304_i2c_read_reg(fe, 0x011d);
++
++	//*ucblocks = r011d;
++
++	*ucblocks = 0;
++
+ 	return 0;
+ }
+ 
+@@ -394,11 +547,13 @@
+ 		.frequency_stepsize = 62500,
+ 		.symbol_rate_min = 5056941,
+ 		.symbol_rate_max = 10762000,
+-		.caps = FE_CAN_QAM_64 | FE_CAN_QAM_256 | FE_CAN_8VSB
++		//.caps = FE_CAN_QAM_64 | FE_CAN_QAM_256 | FE_CAN_8VSB
++		.caps = FE_CAN_QAM_256 | FE_CAN_8VSB,
+ 	},
+ 	.init = lgdt3304_init,
+ 	.sleep = lgdt3304_sleep,
+ 	.set_frontend = lgdt3304_set_parameters,
++	.read_signal_strength = lgdt3304_read_signal_strength,
+ 	.read_snr = lgdt3304_read_snr,
+ 	.read_ber = lgdt3304_read_ber,
+ 	.read_status = lgdt3304_read_status,
+diff -r 80a3bec444d3 tda18271/tda18271.h
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/tda18271/tda18271.h	Sun Mar 01 13:18:05 2009 -0500
+@@ -0,0 +1,99 @@
++/*
++    tda18271.h - header for the Philips / NXP TDA18271 silicon tuner
++
++    Copyright (C) 2007, 2008 Michael Krufky <mkrufky@linuxtv.org>
++
++    This program is free software; you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation; either version 2 of the License, or
++    (at your option) any later version.
++
++    This program is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with this program; if not, write to the Free Software
++    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++*/
++
++#ifndef __TDA18271_H__
++#define __TDA18271_H__
++
++#include <linux/i2c.h>
++#include "dvb_frontend.h"
++
++struct tda18271_std_map_item {
++	u16 if_freq;
++
++	/* EP3[4:3] */
++	unsigned int agc_mode:2;
++	/* EP3[2:0] */
++	unsigned int std:3;
++	/* EP4[7] */
++	unsigned int fm_rfn:1;
++	/* EP4[4:2] */
++	unsigned int if_lvl:3;
++	/* EB22[6:0] */
++	unsigned int rfagc_top:7;
++};
++
++struct tda18271_std_map {
++	struct tda18271_std_map_item fm_radio;
++	struct tda18271_std_map_item atv_b;
++	struct tda18271_std_map_item atv_dk;
++	struct tda18271_std_map_item atv_gh;
++	struct tda18271_std_map_item atv_i;
++	struct tda18271_std_map_item atv_l;
++	struct tda18271_std_map_item atv_lc;
++	struct tda18271_std_map_item atv_mn;
++	struct tda18271_std_map_item atsc_6;
++	struct tda18271_std_map_item dvbt_6;
++	struct tda18271_std_map_item dvbt_7;
++	struct tda18271_std_map_item dvbt_8;
++	struct tda18271_std_map_item qam_6;
++	struct tda18271_std_map_item qam_8;
++};
++
++enum tda18271_role {
++	TDA18271_MASTER = 0,
++	TDA18271_SLAVE,
++};
++
++enum tda18271_i2c_gate {
++	TDA18271_GATE_AUTO = 0,
++	TDA18271_GATE_ANALOG,
++	TDA18271_GATE_DIGITAL,
++};
++
++struct tda18271_config {
++	/* override default if freq / std settings (optional) */
++	struct tda18271_std_map *std_map;
++
++	/* master / slave tuner: master uses main pll, slave uses cal pll */
++	enum tda18271_role role;
++
++	/* use i2c gate provided by analog or digital demod */
++	enum tda18271_i2c_gate gate;
++
++	/* some i2c providers cant write all 39 registers at once */
++	unsigned int small_i2c:1;
++};
++
++#if defined(CONFIG_MEDIA_TUNER_TDA18271) || (defined(CONFIG_MEDIA_TUNER_TDA18271_MODULE) && defined(MODULE))
++extern struct dvb_frontend *tda18271_attach(struct dvb_frontend *fe, u8 addr,
++					    struct i2c_adapter *i2c,
++					    struct tda18271_config *cfg);
++#else
++static inline struct dvb_frontend *tda18271_attach(struct dvb_frontend *fe,
++						   u8 addr,
++						   struct i2c_adapter *i2c,
++						   struct tda18271_config *cfg)
++{
++	printk(KERN_WARNING "%s: driver disabled by Kconfig\n", __func__);
++	return NULL;
++}
++#endif
++
++#endif /* __TDA18271_H__ */
